@@ -1,0 +1,108 @@
+# CodeRabbit Configuration for Quay
+# Focus: Cryptographic integrity, zero-dependency stdlib purity, state machine invariants, socket framing.
+# Docs: https://docs.coderabbit.ai/getting-started/yaml-configuration
+
+language: "en-US"
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: true
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+      - master
+
+  path_filters:
+    - "!dist/**"
+    - "!**/__pycache__/**"
+    - "!**/*.pyc"
+    - "!**/*.egg-info/**"
+    - "!**/.pytest_cache/**"
+    - "!**/.ruff_cache/**"
+    - "!**/*.db"
+    - "!**/*.sqlite"
+    - "!**/*.sqlite3"
+    - "!**/*.tgz"
+
+  path_instructions:
+    - path: "src/quay/store.py"
+      instructions: |
+        Core SQLite append-only storage and cryptographic chain engine.
+        Prioritize:
+        - Cryptographic Integrity: SHA-256 Merkle-style event chaining. Verify that event
+          digests incorporate seq, prev_hash, canonical body text, and timestamp deterministically.
+        - Atomicity & Projections: Counters (signals, work, planes) MUST update transactionally
+          with event insertion (O(1) status invariant). Never allow uncommitted projections.
+        - SQLite Concurrency: Ensure transaction modes (BEGIN IMMEDIATE) and WAL busy handler
+          retry policies prevent locking corruption or deadlocks under multi-process contention.
+        - File System Security: Ensure .quay/ directory is strictly permissions 0700 and
+          database files are 0600.
+    - path: "src/quay/canonical.py"
+      instructions: |
+        Canonical JSON serializer for cryptographic determinism.
+        Prioritize:
+        - Determinism: Strict lexicographical sorting of keys, compact separators (',', ':'),
+          UTF-8 encoding, float representation stability, and rejection of non-serializable objects.
+        - Performance: Verify single-pass encoding without unnecessary double-serializations.
+    - path: "src/quay/schemas.py"
+      instructions: |
+        Typed envelope definitions and write-time state machine rules.
+        Prioritize:
+        - State Machine Invariants: Signal (pending -> claimed -> cleared/expired) and Work
+          (claimed -> in_flight -> done/failed/abandoned/expired) state machines MUST reject illegal
+          transitions before hitting storage.
+        - Causation Integrity: Validate causation sequence references, parent kind matching, and
+          prevent terminal-to-active regressions.
+        - Evidence Verification: Work state 'done' must strictly require evidence payload.
+    - path: "src/quay/protocol.py"
+      instructions: |
+        Wire framing and serialization protocol.
+        Prioritize:
+        - Framing Limits: 4-byte big-endian framing with strict 4 MiB frame limit (MAX_FRAME_BYTES).
+          Verify rejection of frame lengths < 2 or > MAX_FRAME_BYTES without buffer exhaustion.
+        - Error Envelopes: All wire errors must be structured JSON responses with protocol codes.
+    - path: "src/quay/server.py"
+      instructions: |
+        Framed Unix domain socket server and subscriber broadcast engine.
+        Prioritize:
+        - Socket Security: Socket file mode 0600. Clean unlinking on shutdown and crash recovery.
+        - Bounded Outbox & Backpressure: Verify per-client writer queue limits. When outbox is full,
+          verify pushes are dropped cleanly, dropped count is recorded, and 'lagged' frame is sent
+          without blocking the main broadcaster or publisher threads.
+    - path: "src/quay/daemon.py"
+      instructions: |
+        Daemon process lifecycle, locking, and crash resilience.
+        Prioritize:
+        - Lock Hygiene: fcntl.flock on bootstrap.lock and quay.pid.
+        - Process Verification: Reclaim stale locks only after verifying /proc/<pid>/stat start ticks
+          to avoid killing recycled PIDs.
+        - Clean Shutdown: Signal handlers (SIGTERM, SIGINT) must close sockets, checkpoint WAL, and
+          update workspaces registry.
+    - path: "src/quay/migrate.py"
+      instructions: |
+        Changi migration engine.
+        Prioritize:
+        - Root Synthesis: Verify that orphaned legacy events have synthetic roots reconstructed to
+          satisfy Quay state machines without corrupting downstream lineage.
+        - Producer Sanitization: Producer tokens must be normalized to RFC-compliant characters.
+    - path: "tests/**"
+      instructions: |
+        Focus on tamper-detection assertions (quay verify), race conditions, socket disconnection
+        handling, edge cases in state machine validation, and crash recovery.
+    - path: ".github/**"
+      instructions: |
+        Review CI and release workflows for supply-chain security, minimal required permissions,
+        and secure secrets handling.
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  opt_out: false

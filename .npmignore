@@ -1,0 +1,19 @@
+# Ignore Python bytecode
+**/__pycache__/**
+**/*.pyc
+**/*.pyo
+**/*.pyd
+
+# Tests and caches
+tests/
+.git/
+.github/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local ledgers
+.quay/
+.changi/
+*.tgz

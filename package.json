@@ -1,0 +1,41 @@
+{
+  "name": "@agentbus/quay",
+  "version": "0.1.0",
+  "description": "Local-first streaming event ledger and terminal cockpit for one workspace",
+  "license": "MIT",
+  "bin": {
+    "quay": "bin/quay.js",
+    "quayd": "bin/quayd.js"
+  },
+  "files": [
+    "bin/quay.js",
+    "bin/quayd.js",
+    "quay",
+    "quayd",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "python3 -m pytest tests -q"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/onicarps/quay.git"
+  },
+  "homepage": "https://github.com/onicarps/quay",
+  "bugs": {
+    "url": "https://github.com/onicarps/quay/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

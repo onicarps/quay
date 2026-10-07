@@ -1,0 +1,20 @@
+# Quay build and runtime artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+node_modules/
+package-lock.json
+
+# NPM tarballs
+*.tgz
+
+# Local workspaces created while trying the tool out
+.quay/
+.changi/

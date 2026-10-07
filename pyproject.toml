@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling>=1.26,<2.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "okf-quay"
+version = "0.1.0"
+description = "Local-first streaming event ledger and terminal cockpit for one workspace."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "quay contributors" }]
+keywords = ["event-log", "local-first", "terminal", "observability", "agents"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: System :: Logging",
+  "Topic :: System :: Monitoring",
+]
+# Quay has no runtime dependencies by design. See COMPETITIVE_ANALYSIS.md section 7.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+quay = "quay.cli:main"
+quayd = "quay.daemon:daemon_main"
+
+[project.urls]
+Homepage = "https://github.com/onicarps/quay"
+Repository = "https://github.com/onicarps/quay"
+Issues = "https://github.com/onicarps/quay/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/quay"]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+  "src/quay",
+  "tests",
+  "docs",
+  "README.md",
+  "COMPETITIVE_ANALYSIS.md",
+  "LICENSE",
+  "pyproject.toml",
+  "run_demo.sh",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+markers = [
+  "slow: throughput benchmarks that take longer than a second",
+]

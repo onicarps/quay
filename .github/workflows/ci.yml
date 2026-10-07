@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-python:
+    name: Python ${{ matrix.python-version }} on ubuntu-latest
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip pytest
+
+      - name: Run test suite
+        run: |
+          python -m pytest tests -v
+
+      - name: Verify build artifact (wheel & sdist)
+        run: |
+          python -m pip install build
+          python -m build
+
+  test-npm:
+    name: NPM Package Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Pack NPM package
+        run: |
+          npm pack --dry-run
+
+      - name: Test installed npm package
+        shell: bash
+        run: |
+          package_tarball=$(npm pack --silent)
+          install_dir=$(mktemp -d)
+          npm install --global --prefix "$install_dir" "$PWD/$package_tarball"
+          "$install_dir/bin/quay" --version
+          "$install_dir/bin/quayd" --version
+          "$install_dir/bin/quay" --help
+          if QUAY_PYTHON=/no/such/python "$install_dir/bin/quay" --help; then
+            echo "Expected failure with missing Python interpreter"
+            exit 1
+          fi
