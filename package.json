@@ -12,7 +12,7 @@
     "bin/quayd.js",
     "quay",
     "quayd",
-    "src",
+    "src/quay/**/*.py",
     "README.md",
     "LICENSE"
   ],
