@@ -4,20 +4,101 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to publish (for example, v0.1.0)
+        required: true
+        type: string
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
+  verify-release:
+    name: Verify release tag and versions
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+          fetch-depth: 0
+
+      - name: Verify tag points to checked-out commit
+        id: tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          if ! git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "Release tag does not exist: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          commit=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
+          test "$commit" = "$(git rev-parse HEAD)"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify package versions match release tag
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          python - <<'PY'
+          import ast
+          import json
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          pattern = r"v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+          match = re.fullmatch(pattern, tag)
+          if not match or (match[4] and any(
+              part.isdigit() and len(part) > 1 and part.startswith("0")
+              for part in match[4].split(".")
+          )):
+              raise SystemExit(f"Invalid semantic-version release tag: {tag}")
+          version = tag.removeprefix("v")
+
+          python_version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          npm_version = json.loads(Path("package.json").read_text())["version"]
+          tree = ast.parse(Path("src/quay/__init__.py").read_text())
+          package_version = next(
+              ast.literal_eval(node.value)
+              for node in tree.body
+              if isinstance(node, ast.Assign)
+              and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)
+          )
+          for source, actual in (
+              ("pyproject.toml", python_version),
+              ("package.json", npm_version),
+              ("src/quay/__init__.py", package_version),
+          ):
+              if actual != version:
+                  raise SystemExit(f"{source}: version {actual!r} does not match release tag {tag!r}")
+          print(f"Release tag {tag} matches all package versions")
+          PY
+
   pypi-publish:
     name: Publish to PyPI
+    needs: verify-release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     environment:
       name: pypi
       url: https://pypi.org/p/okf-quay
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-release.outputs.commit }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -43,9 +124,15 @@ jobs:
 
   npm-publish:
     name: Publish to NPM
+    needs: verify-release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-release.outputs.commit }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4

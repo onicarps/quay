@@ -39,6 +39,17 @@ jobs:
           python -m pip install build
           python -m build
 
+      - name: Install wheel and exercise Python console scripts
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/quay-wheel-env"
+          "$RUNNER_TEMP/quay-wheel-env/bin/python" -m pip install dist/*.whl
+          (
+            cd "$RUNNER_TEMP"
+            env -u PYTHONPATH "$RUNNER_TEMP/quay-wheel-env/bin/quay" --version
+            env -u PYTHONPATH "$RUNNER_TEMP/quay-wheel-env/bin/quayd" --version
+          )
+
   test-npm:
     name: NPM Package Verification
     runs-on: ubuntu-latest
@@ -62,13 +73,28 @@ jobs:
       - name: Test installed npm package
         shell: bash
         run: |
-          package_tarball=$(npm pack --silent)
           install_dir=$(mktemp -d)
-          npm install --global --prefix "$install_dir" "$PWD/$package_tarball"
-          "$install_dir/bin/quay" --version
-          "$install_dir/bin/quayd" --version
-          "$install_dir/bin/quay" --help
-          if QUAY_PYTHON=/no/such/python "$install_dir/bin/quay" --help; then
+          trap 'rm -rf "$install_dir"' EXIT
+          package_tarball=$(npm pack --pack-destination "$install_dir" --silent)
+          npm install --global --prefix "$install_dir/npm" "$install_dir/$package_tarball"
+          "$install_dir/npm/bin/quay" --version
+          "$install_dir/npm/bin/quayd" --version
+          "$install_dir/npm/bin/quay" --help
+          if QUAY_PYTHON=/no/such/python "$install_dir/npm/bin/quay" --help; then
             echo "Expected failure with missing Python interpreter"
             exit 1
           fi
+          mkdir "$install_dir/workspace"
+          "$install_dir/npm/bin/quay" --workspace "$install_dir/workspace" init --json |
+            WORKSPACE="$install_dir/workspace" node -e '
+              const assert = require("node:assert/strict");
+              const path = require("node:path");
+              let input = "";
+              process.stdin.on("data", chunk => input += chunk);
+              process.stdin.on("end", () => {
+                const result = JSON.parse(input);
+                assert.equal(result.workspace, process.env.WORKSPACE);
+                assert.equal(result.state_dir, path.join(process.env.WORKSPACE, ".quay"));
+                assert.equal(result.git_ignore_applied, false);
+              });
+            '
