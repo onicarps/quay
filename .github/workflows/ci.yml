@@ -73,6 +73,7 @@ jobs:
       - name: Test installed npm package
         shell: bash
         run: |
+          set -o pipefail
           install_dir=$(mktemp -d)
           trap 'rm -rf "$install_dir"' EXIT
           package_tarball=$(npm pack --pack-destination "$install_dir" --silent)
