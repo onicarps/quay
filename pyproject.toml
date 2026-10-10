@@ -3,7 +3,7 @@ requires = ["hatchling>=1.26,<2.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "okf-quay"
+name = "oquay"
 version = "0.1.0"
 description = "Local-first streaming event ledger and terminal cockpit for one workspace."
 readme = "README.md"

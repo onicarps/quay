@@ -42,7 +42,7 @@ quayd --version
 ### Via Pip (PyPI Package)
 
 ```bash
-pip install okf-quay
+pip install oquay
 quay --version
 quayd --version
 ```
