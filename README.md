@@ -27,11 +27,24 @@ and `docs/ARCHITECTURE.md` for the design.
 
 ## Install
 
-Quay runs on Linux and macOS. Requires Python 3.11 or newer (standard library only; zero external Python dependencies).
+Quay runs on Linux and macOS. The recommended installer bootstraps an isolated
+Python runtime automatically, so it works on a fresh machine and never writes
+into an OS-managed Python installation.
+
+### One command (recommended)
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/onicarps/quay/main/install.sh | bash
+```
+
+The installer verifies `quay` before it exits. It also adds its command
+directory to new interactive shells (bash, zsh, and fish). In the current shell, use the direct command
+the installer prints (normally `~/.local/bin/quay`) if `quay` is not already on
+your `PATH`.
 
 ### Via NPM (Global Terminal Binary)
 
-If you have Node.js 18+ and Python 3.11+:
+If you already have Node.js 18+ and Python 3.11+:
 
 ```bash
 npm install --global @agentbus/quay
@@ -39,13 +52,19 @@ quay --version
 quayd --version
 ```
 
-### Via Pip (PyPI Package)
+### Via Pip (existing virtual environment)
 
 ```bash
-pip install oquay
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install oquay
 quay --version
 quayd --version
 ```
+
+Do not use a bare system `pip install` on Ubuntu/Debian: current releases
+correctly protect their managed Python environment. Use the one-command
+installer above when you do not already have a virtual environment.
 
 ### From Local Checkout
 

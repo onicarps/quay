@@ -11,7 +11,7 @@ from __future__ import annotations
 
 __all__ = ["__version__", "PROTOCOL_VERSION", "LEDGER_FORMAT_VERSION"]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 #: Wire protocol version. Bumped only on an incompatible frame change.
 PROTOCOL_VERSION = "1"

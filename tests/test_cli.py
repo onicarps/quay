@@ -343,7 +343,7 @@ class TestUsageAndErrors:
         with pytest.raises(SystemExit) as excinfo:
             cli.main(["--version"])
         assert excinfo.value.code == 0
-        assert "quay 0.1.0" in capsys.readouterr().out
+        assert "quay 0.1.1" in capsys.readouterr().out
 
     def test_unknown_command_is_rejected(self, run):
         code, _out, err = run("frobnicate")
