@@ -47,6 +47,15 @@ MAX_BATCH = 10_000
 #: Busy retry budget for concurrent writers, in seconds.
 WRITE_RETRY_SECONDS = 5.0
 
+#: The single note written when a fresh ledger is auto-initialized. It gives a
+#: brand-new workspace one visible record so the cockpit has proof of life.
+GENESIS_TOPIC = "quay/init"
+GENESIS_PRODUCER = "quay"
+GENESIS_PAYLOAD: dict[str, Any] = {
+    "text": "Quay ledger initialized. Waiting for agent events...",
+    "tags": ["init", "welcome"],
+}
+
 _SIGNAL_TRANSITIONS: dict[str, set[str]] = {
     "pending": {"pending", "claimed", "cleared", "expired"},
     "claimed": {"claimed", "cleared", "expired"},
@@ -68,6 +77,9 @@ _LIKE_SPECIALS = re.compile(r"([\\%_])")
 __all__ = [
     "STATE_DIRECTORY",
     "DATABASE_NAME",
+    "GENESIS_TOPIC",
+    "GENESIS_PRODUCER",
+    "GENESIS_PAYLOAD",
     "LedgerStore",
     "StoreError",
     "utc_now",
@@ -325,6 +337,24 @@ class LedgerStore:
         with self._lock:
             row = self._conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()
             return int(row["c"])
+
+    def ensure_genesis(self) -> dict[str, Any] | None:
+        """Append the genesis note exactly once, when the ledger is empty.
+
+        The emptiness check and the append share one store lock, so two
+        callers can never both observe an empty ledger and write two genesis
+        records. Returns the written event, or ``None`` when the ledger
+        already holds records.
+        """
+        with self._lock:
+            if self.count() != 0:
+                return None
+            return self.append(
+                topic=GENESIS_TOPIC,
+                producer=GENESIS_PRODUCER,
+                payload=dict(GENESIS_PAYLOAD),
+                kind="note",
+            )
 
     def tail(self, limit: int = 50, *, order: str = "desc") -> list[dict[str, Any]]:
         if not 1 <= int(limit) <= 10_000:

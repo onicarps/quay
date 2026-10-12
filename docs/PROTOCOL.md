@@ -93,6 +93,7 @@ and broadcast to subscribers.
 | --- | --- | --- |
 | `emit` | `topic`, `producer`, `payload`, `kind`, `causation_id`, `correlation_id`, `ts` | `{"event": {...}}` |
 | `emit_batch` | `events` (array) | `{"events": [...], "count": n}` |
+| `genesis` | – | `{"created": bool, "event": {...} or null}` |
 | `work_claim` | `key`, `executor`, `title`, `lease_seconds`, `topic`, `correlation_id` | `{"event": {...}}` |
 | `work_heartbeat` | same | `{"event": {...}}` |
 | `work_complete` | `key`, `executor`, `evidence` | `{"event": {...}}` |
@@ -100,6 +101,10 @@ and broadcast to subscribers.
 | `work_reap` | `now` | `{"reaped": [...], "count": n}` |
 | `prune` | `before`, `keep_last`, `dry_run` | prune report |
 | `import` | `source`, `dry_run` | `{"report": {...}}` |
+
+`genesis` appends the single `quay/init` note only when the ledger is empty.
+Repeat or concurrent calls report `created: false` and never write a second
+record, so onboarding is idempotent.
 
 `import` is deliberately not broadcast: a migration can write hundreds of
 thousands of events, and replaying them to live subscribers would turn a bulk

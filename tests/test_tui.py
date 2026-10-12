@@ -12,7 +12,10 @@ import pytest
 
 from quay.tui import (
     FILTER_PRESETS,
+    FIRST_RUN_TIP,
     RESET,
+    SAMPLE_PRODUCER,
+    SAMPLE_TOPIC,
     STYLES,
     Dashboard,
     Screen,
@@ -236,6 +239,9 @@ class TestDashboard:
         text = "\n".join(screen.text_at(row) for row in range(screen.height))
         assert "detach" in text
         assert "verify" in text
+        # The overlay must be painted above the body, not overwritten by it.
+        assert "cycle the kind filter" in text
+        assert "inject a sample agent event" in text
 
     def test_verify_banner_replaces_the_hint_row(self):
         screen = Dashboard().render(sample_model(verify_banner=f"chain ok · 12 events{RESET}"))
@@ -252,6 +258,33 @@ class TestDashboard:
     def test_empty_ledger_renders_a_placeholder(self):
         screen = Dashboard().render(sample_model(events=[]))
         assert "waiting for events" in screen.text_at(3)
+
+    def test_first_run_tip_replaces_the_hints_on_a_small_ledger(self):
+        model = sample_model(status={"ledger": {"records": 1}})
+        screen = Dashboard().render(model)
+        assert FIRST_RUN_TIP in screen.text_at(screen.height - 2)
+        assert "q detach" not in screen.text_at(screen.height - 2)
+
+    def test_first_run_tip_is_shown_at_the_two_record_threshold(self):
+        screen = Dashboard().render(sample_model(status={"ledger": {"records": 2}}))
+        assert FIRST_RUN_TIP in screen.text_at(screen.height - 2)
+
+    def test_hints_return_once_the_ledger_grows(self):
+        screen = Dashboard().render(sample_model())  # records: 12
+        row = screen.text_at(screen.height - 2)
+        assert "q detach" in row
+        assert FIRST_RUN_TIP not in row
+
+    def test_verify_banner_wins_over_the_first_run_tip(self):
+        model = sample_model(status={"ledger": {"records": 1}}, verify_banner="chain ok · 1 events")
+        screen = Dashboard().render(model)
+        row = screen.text_at(screen.height - 2)
+        assert "chain ok" in row
+        assert FIRST_RUN_TIP not in row
+
+    def test_first_run_tip_survives_a_narrow_terminal(self):
+        screen = Dashboard().render(sample_model(width=30, height=12, status={"ledger": {"records": 0}}))
+        assert screen.text_at(screen.height - 2).startswith("Tip: Press [s]")
 
     def test_detail_pane_is_skipped_on_narrow_terminals(self):
         screen = Dashboard().render(sample_model(width=60, height=20))
@@ -273,9 +306,11 @@ class TestDashboard:
 
 
 class FakeClient:
-    def __init__(self, verify: dict | None = None, reap: dict | None = None) -> None:
+    def __init__(self, verify: dict | None = None, reap: dict | None = None, emit_error: Exception | None = None) -> None:
         self.verify_report = verify or {"ok": True, "events_checked": 7, "head_hash": "f" * 64}
         self.reap_report = reap or {"count": 3}
+        self.emit_error = emit_error
+        self.emitted: dict | None = None
         self.calls: list[str] = []
 
     def request(self, op: str, body: dict | None = None) -> dict:
@@ -285,6 +320,13 @@ class FakeClient:
         if op == "work_reap":
             return self.reap_report
         raise AssertionError(f"unexpected op {op}")
+
+    def emit(self, *, topic: str, producer: str, payload: dict | None = None, **extra: object) -> dict:
+        self.calls.append("emit")
+        if self.emit_error is not None:
+            raise self.emit_error
+        self.emitted = {"topic": topic, "producer": producer, "payload": payload, **extra}
+        return {"seq": 7, "kind": extra.get("kind", "generic"), "topic": topic, "producer": producer, "payload": payload}
 
     def query(self, **filters: object) -> list[dict]:
         return [sample_event(seq=1, kind=str(filters.get("kind") or "generic"))]
@@ -376,6 +418,34 @@ class TestTuiApp:
         app.handle_key("b", FakeClient())
         assert "reaped 3" in app.message
 
+    def test_sample_key_emits_a_schema_valid_demo_event(self):
+        app = TuiApp("/tmp/x.sock")
+        client = FakeClient()
+        app.handle_key("s", client)
+        assert client.emitted is not None
+        assert client.emitted["topic"] == SAMPLE_TOPIC
+        assert client.emitted["producer"] == SAMPLE_PRODUCER
+        assert client.emitted["kind"] == "signal"
+        assert client.emitted["payload"] == {
+            "state": "pending",
+            "summary": "sample agent event from the cockpit",
+        }
+        assert "injected sample event #7" in app.message
+
+    def test_sample_key_surfaces_a_failure_without_crashing(self):
+        app = TuiApp("/tmp/x.sock")
+        client = FakeClient(emit_error=RuntimeError("daemon gone"))
+        assert app.handle_key("s", client) is True
+        assert "sample event failed" in app.message
+        assert "daemon gone" in app.message
+
+    def test_help_overlay_documents_the_sample_key(self):
+        app = TuiApp("/tmp/x.sock")
+        app.handle_key("?", FakeClient())
+        screen = app.dashboard.render(app.model(width=100, height=30))
+        text = "\n".join(screen.text_at(row) for row in range(screen.height))
+        assert "inject a sample agent event" in text
+
     def test_model_is_serializable_and_complete(self):
         app = TuiApp("/tmp/x.sock", workspace="/w")
         model = app.model(width=80, height=24)
@@ -452,6 +522,27 @@ class TestTuiLoopOverARealSocket:
         assert "signal" in output.getvalue()
         screen = app.dashboard.render(app.model(width=100, height=24))
         assert "filter: signal" in screen.text_at(1)
+
+    def test_loop_sample_key_writes_a_real_event(self, server, client):
+        import io
+
+        from quay.client import SubscriptionStream
+
+        app = TuiApp(server.socket_path, workspace=str(server.paths.workspace), refresh_seconds=0.0)
+        with SubscriptionStream(server.socket_path, filters={}, replay=5) as live:
+            code = app._loop(  # noqa: SLF001 - the documented test seam
+                client,
+                live,
+                reader_factory=self.key_reader("s", "q"),
+                output=io.StringIO(),
+                max_iterations=6,
+            )
+        assert code == 0
+        events = client.query(topic=SAMPLE_TOPIC, limit=5)
+        assert len(events) == 1
+        assert events[0]["kind"] == "signal"
+        assert events[0]["producer"] == SAMPLE_PRODUCER
+        assert events[0]["payload"]["state"] == "pending"
 
     def test_loop_bounds_itself_when_no_keys_arrive(self, server, client):
         import io

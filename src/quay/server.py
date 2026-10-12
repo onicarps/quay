@@ -55,7 +55,7 @@ from .workspace import (
 )
 
 #: Operations that mutate the ledger; they broadcast to subscribers afterwards.
-WRITE_OPS = frozenset({"emit", "emit_batch", "work_claim", "work_heartbeat", "work_complete", "work_abandon", "work_reap", "prune", "import"})
+WRITE_OPS = frozenset({"emit", "emit_batch", "genesis", "work_claim", "work_heartbeat", "work_complete", "work_abandon", "work_reap", "prune", "import"})
 
 #: Operations that any client may call.
 READ_OPS = frozenset(
@@ -792,6 +792,20 @@ class QuayServer:
         }
         written = self._emit_locked([event])
         return {"event": written[0]}, False
+
+    def _op_genesis(self, body, connection):
+        """Append the genesis note once, when the ledger is empty.
+
+        The count-and-append decision runs inside the daemon's write lock and
+        the store's own lock, so a repeated or concurrent onboarding can never
+        write a second genesis record.
+        """
+        with self._write_lock:
+            event = self.store.ensure_genesis()
+        if event is None:
+            return {"created": False, "event": None}, False
+        self.broadcast_event(event)
+        return {"created": True, "event": event}, False
 
     def _op_emit_batch(self, body, connection):
         raw = body.get("events")

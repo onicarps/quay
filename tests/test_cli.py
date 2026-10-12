@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from quay import cli
+from quay import __version__, cli
 from quay.daemon import stop_daemon
 
 
@@ -337,13 +337,124 @@ class TestWatch:
         code, _out, _err = run("watch", "--plain", "--history", "0", "--for", "0.3")
         assert code == 0
 
+    def test_monitor_is_a_true_alias_of_watch(self):
+        parser = cli.build_parser()
+        subparsers = [
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        ][0]
+        assert "monitor" in subparsers.choices
+        assert cli.COMMANDS["monitor"] is cli.COMMANDS["watch"]
+
+        def option_strings(parser):
+            return {option for action in parser._actions for option in action.option_strings}
+
+        def positionals(parser):
+            return [action.dest for action in parser._actions if not action.option_strings]
+
+        assert option_strings(subparsers.choices["monitor"]) == option_strings(subparsers.choices["watch"])
+        assert positionals(subparsers.choices["monitor"]) == positionals(subparsers.choices["watch"])
+
+    def test_monitor_plain_streams_like_watch(self, run, ws):
+        for index in range(3):
+            run("emit", "t", json.dumps({"i": index}))
+        code, out, _err = run("monitor", "--plain", "--history", "3", "--max-events", "3")
+        assert code == 0
+        lines = [json.loads(line) for line in out.splitlines() if line.strip()]
+        assert [event["seq"] for event in lines] == [1, 2, 3]
+
+    def test_monitor_auto_initializes_a_fresh_workspace(self, run, ws):
+        code, out, err = run("monitor")
+        assert code == 0
+        assert as_json(out)["ledger"]["records"] == 1
+        assert "no TTY" in err
+
+
+class TestPositionalWorkspace:
+    def test_positional_directory_opens_the_cockpit_snapshot(self, run, ws):
+        code, out, err = run(".")
+        assert code == 0
+        assert as_json(out)["daemon"]["workspace"] == str(ws)
+        assert "no TTY" in err
+
+    def test_positional_path_auto_initializes_and_seeds_one_genesis_event(self, run, tmp_path):
+        target = tmp_path / "fresh"
+        target.mkdir()
+        code, out, _err = run(str(target))
+        assert code == 0
+        assert as_json(out)["ledger"]["records"] == 1
+
+        # A repeat invocation must not append a second genesis record.
+        code, out, _err = run(str(target))
+        assert code == 0
+        assert as_json(out)["ledger"]["records"] == 1
+
+        events = as_json(run("--workspace", str(target), "log", "--limit", "5")[1])["events"]
+        assert len(events) == 1
+        genesis = events[0]
+        assert (genesis["seq"], genesis["kind"], genesis["topic"], genesis["producer"]) == (
+            1,
+            "note",
+            "quay/init",
+            "quay",
+        )
+        assert genesis["payload"] == {
+            "text": "Quay ledger initialized. Waiting for agent events...",
+            "tags": ["init", "welcome"],
+        }
+
+    def test_positional_path_creates_state_only_inside_the_target(self, run, ws, tmp_path):
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        assert run(str(target))[0] == 0
+        assert (target / ".quay" / "ledger.db").exists()
+        assert not (ws / ".quay").exists()
+
+    def test_positional_unknown_token_is_a_usage_error(self, run):
+        code, _out, err = run("frobnicate")
+        assert code == 2
+        assert as_json(err)["error"]["code"] in ("usage", "unknown_command")
+
+    def test_positional_file_is_not_a_workspace(self, run, ws):
+        target = ws / "notes.txt"
+        target.write_text("hello", encoding="utf-8")
+        code, _out, err = run(str(target))
+        assert code == 2
+        assert as_json(err)["error"]["code"] == "usage"
+
+    def test_filesystem_root_is_rejected(self, run):
+        code, _out, err = run("--workspace", "/", "status")
+        assert code == 2
+        assert as_json(err)["error"]["code"] == "unsafe_workspace"
+
+    def test_positional_path_conflicts_with_the_workspace_flag(self, run, ws):
+        code, _out, err = run("watch", str(ws), "--workspace", str(ws))
+        assert code == 2
+        assert as_json(err)["error"]["code"] == "conflicting_workspace"
+
+    def test_onboarding_appends_exactly_one_gitignore_line(self, run, tmp_path):
+        root = tmp_path / "repo"
+        root.mkdir()
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        (root / ".gitignore").write_text(".venv", encoding="utf-8")
+        assert run(str(root))[0] == 0
+        assert run(str(root))[0] == 0
+        assert (root / ".gitignore").read_text(encoding="utf-8") == ".venv\n.quay/\n"
+
+    def test_onboarding_leaves_gitignore_alone_outside_git(self, run, tmp_path):
+        root = tmp_path / "plain"
+        root.mkdir()
+        assert run(str(root))[0] == 0
+        assert not (root / ".gitignore").exists()
+
 
 class TestUsageAndErrors:
     def test_version_exits_zero(self, capsys):
         with pytest.raises(SystemExit) as excinfo:
             cli.main(["--version"])
         assert excinfo.value.code == 0
-        assert "quay 0.1.1" in capsys.readouterr().out
+        assert f"quay {__version__}" in capsys.readouterr().out
 
     def test_unknown_command_is_rejected(self, run):
         code, _out, err = run("frobnicate")
@@ -374,6 +485,8 @@ class TestUsageAndErrors:
             "query",
             "log",
             "watch",
+            "monitor",
+            "mcp",
             "prune",
             "bench",
             "import",
@@ -388,6 +501,9 @@ class TestUsageAndErrors:
             if isinstance(action, argparse._SubParsersAction)
         ][0]
         assert set(subparsers.choices) == set(cli.COMMANDS)
+        # `monitor` is a true alias: one handler, one definition.
+        assert cli.COMMANDS["monitor"] is cli.COMMANDS["watch"]
+        assert cli.COMMANDS["mcp"] is cli.cmd_mcp
 
     def test_import_requires_an_existing_source(self, run, tmp_path):
         code, _out, err = run("import", str(tmp_path / "missing.db"), "--json")

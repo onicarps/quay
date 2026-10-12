@@ -12,7 +12,9 @@ All durable Quay state for a workspace lives in ``<workspace>/.quay/``:
 A small cross-workspace registry lives at
 ``${XDG_CONFIG_HOME:-~/.config}/quay/workspaces.json`` so ``quay daemons`` can
 show every workspace this user has a daemon in. Quay never deletes a ledger
-implicitly and never edits Git configuration.
+implicitly. The only Git file Quay ever touches is the enclosing worktree's
+``.gitignore``, and only to append the single ``.quay/`` line during
+onboarding (see :func:`ensure_git_ignore`).
 """
 
 from __future__ import annotations
@@ -68,6 +70,8 @@ __all__ = [
     "register_workspace",
     "unregister_workspace",
     "git_advisory",
+    "git_worktree_root",
+    "ensure_git_ignore",
 ]
 
 
@@ -115,6 +119,11 @@ def canonical_workspace(value: str | os.PathLike[str]) -> Path:
 def paths_for(workspace: str | os.PathLike[str], *, create: bool = True) -> LedgerPaths:
     """Return the runtime paths for ``workspace``, creating ``.quay`` if asked."""
     root = canonical_workspace(workspace)
+    if root.parent == root:
+        raise WorkspaceError(
+            "unsafe_workspace",
+            f"refusing to use the filesystem root as a workspace: {root}",
+        )
     state_root = root / STATE_DIRECTORY
     if state_root.exists() or state_root.is_symlink():
         info = state_root.lstat()
@@ -123,7 +132,12 @@ def paths_for(workspace: str | os.PathLike[str], *, create: bool = True) -> Ledg
                 "unsafe_state_path", f"refusing non-directory runtime path: {state_root}"
             )
     elif create:
-        state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except OSError as exc:
+            raise WorkspaceError(
+                "workspace_not_writable", f"cannot create {state_root}: {exc}"
+            ) from exc
     else:
         raise WorkspaceError("no_state", f"no Quay state in {root}")
     if create:
@@ -352,7 +366,9 @@ def unregister_workspace(paths: LedgerPaths) -> None:
 def git_advisory(workspace: Path) -> str | None:
     """Return an advisory string when ``.quay/`` is visible to Git.
 
-    Quay never edits ``.gitignore``; it only tells the user.
+    ``quay init`` never edits ``.gitignore``; it only tells the user.
+    Onboarding (:func:`ensure_git_ignore`) is the one place that appends the
+    ignore line, and only for the auto-initialized cockpit and MCP bridge.
     """
     try:
         inside = subprocess.run(
@@ -379,6 +395,52 @@ def git_advisory(workspace: Path) -> str | None:
         return None
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
+
+
+def git_worktree_root(workspace: Path) -> Path | None:
+    """Return the enclosing Git worktree root for ``workspace``, or None."""
+    try:
+        inside = subprocess.run(
+            ["git", "-C", str(workspace), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if inside.returncode != 0:
+        return None
+    top = inside.stdout.strip()
+    return Path(top) if top else None
+
+
+def ensure_git_ignore(workspace: Path) -> str | None:
+    """Append exactly one ``.quay/`` line to the enclosing worktree's ``.gitignore``.
+
+    Returns the path that changed, or ``None`` when there is nothing to do:
+    the target is outside Git, the line is already present, or the
+    ``.gitignore`` is a symlink (never write through a link). The append is
+    idempotent and preserves the existing contents and newline handling.
+    """
+    top = git_worktree_root(workspace)
+    if top is None:
+        return None
+    target = top / ".gitignore"
+    if target.is_symlink():
+        return None
+    try:
+        before = target.read_text(encoding="utf-8") if target.exists() else ""
+    except OSError:
+        return None
+    if any(line.strip() == f"{STATE_DIRECTORY}/" for line in before.splitlines()):
+        return None
+    suffix = "" if not before or before.endswith("\n") else "\n"
+    try:
+        target.write_text(before + suffix + f"{STATE_DIRECTORY}/\n", encoding="utf-8")
+    except OSError:
+        return None
+    return str(target)
 
 
 def daemon_script() -> Path:

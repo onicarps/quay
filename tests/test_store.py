@@ -17,6 +17,9 @@ import pytest
 from conftest import SRC
 from quay.canonical import GENESIS_HASH, canonical_json, event_digest
 from quay.store import (
+    GENESIS_PAYLOAD,
+    GENESIS_PRODUCER,
+    GENESIS_TOPIC,
     STATE_DIRECTORY,
     LedgerStore,
     StoreError,
@@ -527,6 +530,57 @@ class TestConcurrencyAndCrash:
         finally:
             first.close()
             second.close()
+
+
+class TestGenesis:
+    """The single onboarding record written into a fresh ledger."""
+
+    def test_genesis_is_written_once_with_the_exact_shape(self, ledger_path: Path):
+        store = LedgerStore(ledger_path)
+        try:
+            event = store.ensure_genesis()
+            assert event is not None
+            assert event["seq"] == 1
+            assert event["kind"] == "note"
+            assert event["topic"] == GENESIS_TOPIC
+            assert event["producer"] == GENESIS_PRODUCER
+            assert GENESIS_PAYLOAD == {
+                "text": "Quay ledger initialized. Waiting for agent events...",
+                "tags": ["init", "welcome"],
+            }
+            assert event["payload"] == GENESIS_PAYLOAD
+            assert store.ensure_genesis() is None
+            assert store.count() == 1
+            assert store.verify()["ok"] is True
+        finally:
+            store.close()
+
+    def test_genesis_is_skipped_when_the_ledger_already_has_records(self, store: LedgerStore):
+        store.append(topic="t", producer="p", payload={"i": 1})
+        assert store.ensure_genesis() is None
+        assert store.count() == 1
+
+    def test_concurrent_genesis_writes_exactly_one_record(self, ledger_path: Path):
+        store = LedgerStore(ledger_path)
+        results: list[object] = []
+        barrier = threading.Barrier(8)
+
+        def worker() -> None:
+            barrier.wait()
+            results.append(store.ensure_genesis())
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+            assert sum(1 for item in results if item is not None) == 1
+            assert store.count() == 1
+            assert store.get(1)["topic"] == GENESIS_TOPIC
+            assert store.verify()["ok"] is True
+        finally:
+            store.close()
 
 
 class TestLifecycle:

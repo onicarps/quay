@@ -86,13 +86,20 @@ python3 -m quay.cli --help
 
 ```bash
 cd ~/my-project
-quay init                       # create .quay/ and check the Git advisory
+quay                            # create .quay/, start the daemon, open the cockpit
+quay init                       # explicit setup; only checks the Git advisory
 
 quay emit build/log '{"text": "compiled ok", "tags": ["build"]}' --kind note
 quay emit build/alert '{"summary": "disk almost full"}' --kind signal
 quay log --limit 5
 quay status
 ```
+
+Point Quay at a folder and it does the setup itself: `quay [PATH]`, bare
+`quay`, and `quay monitor [PATH]` create `.quay/`, start (or reuse) the
+daemon, append `.quay/` to the enclosing worktree's `.gitignore`, and write a
+single genesis note. Nothing else changes outside that folder. `quay init`
+stays the explicit, preview-only path.
 
 Payloads are validated per kind. A `note` carries `text` (plus optional
 `tags`), a `signal` carries `summary` and a state, a `metric` carries `name` and
@@ -153,7 +160,10 @@ stdout is not a terminal; `--no-json` forces the human rendering.
 | `quay work list [--state S] [--executor E]` / `quay work reap` | Inspect work and expire lapsed leases |
 | `quay query [filters]` | Search with kind, topic glob, producer, state, correlation, causation, seq range, time range, and text filters; `--count-only`, `--export jsonl\|csv`, `--limit`, `--offset`, `--order` |
 | `quay log [--limit N] [--follow] [--for S] [--max-events N]` | Recent events, optionally streaming |
-| `quay watch [--kind K] [--plain] [--history N] [--for S] [--max-events N]` | Live TUI cockpit, or JSON lines with `--plain` |
+| `quay watch [PATH] [--kind K] [--plain] [--history N] [--for S] [--max-events N]` | Live TUI cockpit, or JSON lines with `--plain` |
+| `quay monitor [PATH] [--kind K] [--plain] [--history N] [--for S] [--max-events N]` | Alias for `quay watch`, and it auto-initializes the workspace |
+| `quay [PATH]` | Implicit cockpit: opens `PATH` (default: the current directory), auto-initializing it |
+| `quay mcp [--workspace PATH]` | Serve the workspace over a dependency-free stdio MCP bridge |
 | `quay prune (--keep-last N \| --before TS) [--dry-run] [--yes]` | Delete an old prefix after a checkpoint |
 | `quay bench [--scale quick\|full] [--out FILE]` | Run the benchmark suite |
 | `quay import SOURCE [--dry-run] [--max-warnings N]` | Import a Changi ledger (see `docs/MIGRATION.md`) |
@@ -165,22 +175,43 @@ validation error, `3` the daemon is unreachable.
 
 ## Terminal cockpit
 
-`quay watch` renders a full-screen dashboard: daemon health, ledger counters,
-plane counts, a live event stream, and a filter bar. Keys:
+`quay watch` (or `quay monitor`, or bare `quay`) renders a full-screen
+dashboard: daemon health, ledger counters, plane counts, a live event stream,
+and a filter bar. A fresh ledger shows an onboarding tip instead of the key
+hints. Keys:
 
 | Key | Action |
 | --- | --- |
 | `q` | quit |
-| `p` | pause or resume the stream |
+| `↑`/`↓`, `j`/`k` | move the selection |
+| `g`/`G` | jump to oldest / newest |
+| `space` | pause or resume the stream |
+| `f` | cycle the kind filter |
+| `1`-`5` | jump to a kind filter |
+| `d` | toggle the detail pane |
+| `s` | inject a sample agent event |
 | `v` | run verification and show the result |
-| `r` | reap expired leases |
-| `k` | cycle the kind filter |
-| `/` | edit the topic filter |
+| `b` | reap expired leases |
 | `?` | help overlay |
 
 The dashboard redraws with minimal ANSI diffs rather than repainting the whole
 screen, so it stays usable over a slow terminal. `quay watch --plain` prints
 JSON lines instead, which is what you want in a pipe or a log.
+
+## MCP bridge
+
+`quay mcp` serves the workspace over stdio as a line-delimited JSON-RPC 2.0
+MCP server, using only the Python standard library. It exposes `quay_emit`,
+`quay_log`, `quay_status`, `quay_work_claim`, and `quay_work_complete`, and
+writes through the same daemon and schema validation as the CLI:
+
+```json
+{
+  "mcpServers": {
+    "quay": {"command": "quay", "args": ["mcp", "--workspace", "/path/to/workspace"]}
+  }
+}
+```
 
 ## Python API
 

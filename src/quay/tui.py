@@ -209,6 +209,19 @@ def age_of(timestamp: str | None, *, now: float | None = None) -> str:
     return f"{int(seconds // 86400):>2d}d"
 
 
+def _ledger_records(status: Mapping[str, Any] | None) -> int | None:
+    """Return the ledger record count from a status snapshot, if present."""
+    if not isinstance(status, Mapping):
+        return None
+    ledger = status.get("ledger")
+    if not isinstance(ledger, Mapping):
+        return None
+    records = ledger.get("records")
+    if isinstance(records, bool) or not isinstance(records, int):
+        return None
+    return records
+
+
 HELP_LINES = (
     "  q / Ctrl-C   detach (the daemon keeps running)",
     "  ↑ / ↓, k / j move the selection",
@@ -217,10 +230,22 @@ HELP_LINES = (
     "  f            cycle the kind filter",
     "  1 - 5        jump to a specific kind filter",
     "  d            toggle the detail pane",
+    "  s            inject a sample agent event",
     "  v            verify the ledger hash chain",
     "  b            reap expired work leases",
     "  ?            close this help",
 )
+
+#: Shown in place of the key hints until the ledger has more than
+#: :data:`FIRST_RUN_RECORDS` records, so a fresh cockpit teaches itself.
+FIRST_RUN_TIP = "Tip: Press [s] to inject a sample agent event | [v] verify hash chain | [q] detach"
+FIRST_RUN_RECORDS = 2
+
+#: The demo event the ``s`` key injects through the live client.
+SAMPLE_TOPIC = "quay/demo"
+SAMPLE_PRODUCER = "quay"
+
+HINT_LINE = " q detach  ↑↓ move  space pause  f filter  1-5 kind  d detail  s sample  v verify  b reap  ? help"
 
 
 class Dashboard:
@@ -240,8 +265,6 @@ class Dashboard:
         ledger = status.get("ledger", {}) if isinstance(status, Mapping) else {}
 
         self._header(screen, model, health, ledger)
-        if model.get("help"):
-            self._overlay(screen, "keys", HELP_LINES)
         body_top = 3
         body_bottom = height - 3
         if body_bottom < body_top:
@@ -254,6 +277,10 @@ class Dashboard:
         if show_side:
             self._planes(screen, body_top, stream_rows, width - 34, status)
         self._footer(screen, height - 2, model, status)
+        # The overlay is drawn last so the body cannot paint over it; its box
+        # never reaches the footer row, so the verify banner stays visible.
+        if model.get("help"):
+            self._overlay(screen, "keys", HELP_LINES)
         return screen
 
     def _columns(self, screen: Screen, row: int, width: int) -> None:
@@ -361,8 +388,11 @@ class Dashboard:
         if model.get("verify_banner"):
             screen.put(row, 0, f" {model['verify_banner']}", "ok" if str(model["verify_banner"]).startswith("chain ok") else "bad")
             return
-        hints = " q detach  ↑↓ move  space pause  f filter  1-5 kind  d detail  v verify  b reap  ? help"
-        screen.put(row, 0, hints, "dim")
+        records = _ledger_records(status)
+        if records is not None and records <= FIRST_RUN_RECORDS:
+            screen.put(row, 0, FIRST_RUN_TIP, "accent")
+            return
+        screen.put(row, 0, HINT_LINE, "dim")
 
     def _overlay(self, screen: Screen, title: str, lines: Iterable[str]) -> None:
         body = list(lines)
@@ -487,11 +517,27 @@ class TuiApp:
             self.reload_history(client)
         elif key == "d":
             self.dashboard.detail = not self.dashboard.detail
+        elif key == "s":
+            self.run_sample(client)
         elif key == "v":
             self.run_verify(client)
         elif key == "b":
             self.run_reap(client)
         return True
+
+    def run_sample(self, client) -> None:
+        """Inject one schema-valid demo event so the planes visibly move."""
+        try:
+            event = client.emit(
+                topic=SAMPLE_TOPIC,
+                producer=SAMPLE_PRODUCER,
+                payload={"state": "pending", "summary": "sample agent event from the cockpit"},
+                kind="signal",
+            )
+        except Exception as exc:  # pragma: no cover - surfaced in the UI
+            self.message = f"sample event failed: {exc}"
+            return
+        self.message = f"injected sample event #{event.get('seq')} on {SAMPLE_TOPIC}"
 
     def run_verify(self, client) -> None:
         try:

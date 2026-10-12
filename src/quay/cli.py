@@ -29,6 +29,7 @@ from typing import Any, Callable, Mapping, Sequence
 from . import PROTOCOL_VERSION, __version__
 from .client import ClientError, QuayClient, SubscriptionStream
 from .daemon import all_daemon_status, daemon_health, ensure_daemon, stop_daemon
+from .onboarding import onboard
 from .store import StoreError, utc_now
 from .tui import TuiApp
 from .workspace import (
@@ -119,6 +120,27 @@ class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> None:  # pragma: no cover - argparse path
         emit_error("usage", message, json_mode=not sys.stdout.isatty())
         raise SystemExit(EXIT_USAGE)
+
+
+def _add_cockpit_parser(
+    subparsers: argparse._SubParsersAction,
+    common: argparse.ArgumentParser,
+    name: str,
+    help_text: str,
+) -> argparse.ArgumentParser:
+    """Register one cockpit command (``watch`` or its ``monitor`` alias).
+
+    Both names are built from this one definition and share :func:`cmd_watch`,
+    so ``monitor`` stays a true alias instead of a divergent copy.
+    """
+    node = subparsers.add_parser(name, parents=[common], help=help_text)
+    node.add_argument("path", nargs="?", default=None, help="workspace directory (default: current directory)")
+    node.add_argument("--kind", default=None, help="initial kind filter")
+    node.add_argument("--plain", action="store_true", help="stream JSON lines instead of the TUI")
+    node.add_argument("--history", type=int, default=200)
+    node.add_argument("--max-events", type=int, default=None, help="plain mode: stop after N events")
+    node.add_argument("--for", dest="duration", type=float, default=None, help="plain mode: stop after N seconds")
+    return node
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -223,12 +245,10 @@ def build_parser() -> argparse.ArgumentParser:
     log.add_argument("--for", dest="duration", type=float, default=None, help="stop after N seconds")
     log.add_argument("--max-events", type=int, default=None, help="stop after N streamed events")
 
-    watch = subparsers.add_parser("watch", parents=[common], help="attach the live cockpit")
-    watch.add_argument("--kind", default=None, help="initial kind filter")
-    watch.add_argument("--plain", action="store_true", help="stream JSON lines instead of the TUI")
-    watch.add_argument("--history", type=int, default=200)
-    watch.add_argument("--max-events", type=int, default=None, help="plain mode: stop after N events")
-    watch.add_argument("--for", dest="duration", type=float, default=None, help="plain mode: stop after N seconds")
+    _add_cockpit_parser(subparsers, common, "watch", "attach the live cockpit")
+    _add_cockpit_parser(subparsers, common, "monitor", "attach the live cockpit (alias for watch)")
+
+    subparsers.add_parser("mcp", parents=[common], help="serve the workspace over a stdio MCP bridge")
 
     prune = subparsers.add_parser("prune", parents=[common], help="delete old events after a checkpoint")
     prune.add_argument("--keep-last", type=int, default=None)
@@ -653,8 +673,24 @@ def _follow(args: argparse.Namespace, *, json_mode: bool, initial_limit: int) ->
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
+    json_mode = _json_mode(args)
+    if getattr(args, "path", None) is not None:
+        if getattr(args, "workspace", None):
+            emit_error(
+                "conflicting_workspace",
+                "give either a positional path or --workspace, not both",
+                json_mode=json_mode,
+            )
+            return EXIT_USAGE
+        args.workspace = args.path
     root = workspace_path(args)
-    paths, _health = ensure_daemon(root, idle_seconds=getattr(args, "idle_seconds", None))
+    # The implicit cockpit (`quay [PATH]`, bare `quay`) and `quay monitor` are
+    # the zero-friction path: they may create the workspace and seed it.
+    auto_init = bool(getattr(args, "auto_init", False)) or getattr(args, "command", None) == "monitor"
+    if auto_init:
+        paths = onboard(root, idle_seconds=getattr(args, "idle_seconds", None)).paths
+    else:
+        paths, _health = ensure_daemon(root, idle_seconds=getattr(args, "idle_seconds", None))
     interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.plain
     if interactive:
         app = TuiApp(
@@ -665,7 +701,6 @@ def cmd_watch(args: argparse.Namespace) -> int:
         )
         return app.run()
 
-    json_mode = _json_mode(args)
     if not args.plain:
         # No TTY and no explicit --plain: print a snapshot instead of
         # streaming forever, which is what a script or CI job wants.
@@ -675,6 +710,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
         emit_result(status, json_mode=True)
         return EXIT_OK
     return _follow(args, json_mode=True if json_mode else False, initial_limit=int(args.history))
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    from .mcp import serve
+
+    return serve(getattr(args, "workspace", None) or os.getcwd())
 
 
 def cmd_import(args: argparse.Namespace) -> int:
@@ -766,10 +807,56 @@ COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
     "query": cmd_query,
     "log": cmd_log,
     "watch": cmd_watch,
+    "monitor": cmd_watch,
+    "mcp": cmd_mcp,
     "prune": cmd_prune,
     "bench": cmd_bench,
     "import": cmd_import,
 }
+
+
+def _first_free_token(argv: Sequence[str]) -> int | None:
+    """Index of the first token that is neither an option nor an option value."""
+    takes_value = ("--workspace", "--timeout")
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return None
+        if token in takes_value:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return index
+    return None
+
+
+def _normalize_positional_workspace(argv: Sequence[str]) -> tuple[list[str], bool]:
+    """Rewrite ``quay PATH`` into ``quay watch --workspace PATH``.
+
+    Only the first free token is considered, and only when it resolves to an
+    existing directory and is not a registered command. Everything else falls
+    through to argparse's ordinary usage error, so a typo can never silently
+    create a workspace.
+    """
+    tokens = list(argv)
+    if "--workspace" in tokens or any(token.startswith("--workspace=") for token in tokens):
+        return tokens, False
+    index = _first_free_token(tokens)
+    if index is None:
+        return tokens, False
+    candidate = tokens[index]
+    if candidate in COMMANDS:
+        return tokens, False
+    try:
+        if not Path(candidate).expanduser().is_dir():
+            return tokens, False
+    except OSError:  # pragma: no cover - defensive; is_dir rarely raises
+        return tokens, False
+    normalized = tokens[:index] + ["watch", "--workspace", candidate] + tokens[index + 1 :]
+    return normalized, True
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -779,8 +866,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     process; usage errors are reported and returned as ``EXIT_USAGE``.
     """
     parser = build_parser()
+    normalized, implicit_workspace = _normalize_positional_workspace(
+        list(argv) if argv is not None else sys.argv[1:]
+    )
     try:
-        args = parser.parse_args(list(argv) if argv is not None else None)
+        args = parser.parse_args(normalized)
     except SystemExit as exit_request:
         code = exit_request.code if isinstance(exit_request.code, int) else EXIT_USAGE
         if code == 0:
@@ -796,6 +886,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.duration = None
         command = "watch"
         args.command = command
+        implicit_workspace = True
+    if implicit_workspace:
+        # `quay [PATH]` may safely create the workspace it points at.
+        args.auto_init = True
     handler = COMMANDS.get(command)
     if handler is None:
         emit_error("unknown_command", f"unknown command: {command}", json_mode=_json_mode(args))
