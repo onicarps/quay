@@ -230,6 +230,15 @@ def _ledger_records(status: Mapping[str, Any] | None) -> int | None:
     return records
 
 
+def _event_seq(event: Mapping[str, Any]) -> int:
+    """Extract integer event sequence number safely for sorting."""
+    val = event.get("seq")
+    try:
+        return int(val) if val is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 HELP_LINES = (
     "  q / Ctrl-C   detach (the daemon keeps running)",
     "  ↑ / ↓, k / j move the selection",
@@ -491,7 +500,11 @@ class TuiApp:
         kind = self.filter_kind
         if kind is not None and event.get("kind") != kind:
             return
+        seq = event.get("seq")
+        if seq is not None and any(e.get("seq") == seq for e in self.events):
+            return
         self.events.insert(0, dict(event))
+        self.events.sort(key=_event_seq, reverse=True)
         del self.events[self.history :]
 
     def reload_history(self, client) -> None:
@@ -502,6 +515,7 @@ class TuiApp:
             self.message = f"history reload failed: {exc}"
             return
         self.events = [dict(event) for event in events]
+        self.events.sort(key=_event_seq, reverse=True)
         self.selection = 0
 
     # ------------------------------------------------------------------ redraw

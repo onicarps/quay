@@ -417,6 +417,40 @@ class TestTuiApp:
             app.ingest(sample_event(seq=seq))
         assert [event["seq"] for event in app.events] == [5, 4, 3]
 
+    def test_ingest_deduplicates_by_sequence(self):
+        app = TuiApp("/tmp/x.sock", history=10)
+        app.ingest(sample_event(seq=1))
+        app.ingest(sample_event(seq=2))
+        # Re-ingesting existing sequences must be ignored
+        app.ingest(sample_event(seq=1))
+        app.ingest(sample_event(seq=2))
+        assert [event["seq"] for event in app.events] == [2, 1]
+
+    def test_ingest_handles_missing_sequence(self):
+        app = TuiApp("/tmp/x.sock", history=10)
+        e1 = sample_event(seq=None)
+        e2 = sample_event(seq=None)
+        app.ingest(e1)
+        app.ingest(e2)
+        assert len(app.events) == 2
+
+    def test_reload_history_and_replayed_ingest_deduplicates(self):
+        app = TuiApp("/tmp/x.sock", history=10)
+        client = FakeClient()
+        app.reload_history(client)
+        assert [e["seq"] for e in app.events] == [1]
+        # Replayed frame with seq=1 arrives from stream
+        app.ingest(sample_event(seq=1))
+        assert [e["seq"] for e in app.events] == [1]
+
+    def test_ingest_maintains_descending_sequence_order(self):
+        app = TuiApp("/tmp/x.sock", history=10)
+        app.ingest(sample_event(seq=2))
+        app.ingest(sample_event(seq=5))
+        app.ingest(sample_event(seq=1))
+        app.ingest(sample_event(seq=4))
+        assert [event["seq"] for event in app.events] == [5, 4, 2, 1]
+
     def test_ingest_ignores_non_matching_kinds(self):
         app = TuiApp("/tmp/x.sock", filter_kind="work")
         app.ingest(sample_event(seq=1, kind="note"))
