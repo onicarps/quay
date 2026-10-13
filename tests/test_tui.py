@@ -6,13 +6,20 @@ rendered to strings, so every visual rule is asserted without a terminal.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import os
+import re
+import signal
 import time
 
 import pytest
 
 from quay.tui import (
+    CLEAR_SCREEN,
     FILTER_PRESETS,
     FIRST_RUN_TIP,
+    REFRESH_KEY,
     RESET,
     SAMPLE_PRODUCER,
     SAMPLE_TOPIC,
@@ -24,6 +31,7 @@ from quay.tui import (
     render_diff,
     sanitize,
     summarize_event,
+    terminal_session,
 )
 
 
@@ -73,6 +81,72 @@ def sample_model(**overrides: object) -> dict:
     }
     model.update(overrides)
     return model
+
+
+_ANSI_SEQUENCE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_CELL_POSITION = re.compile(r"\x1b\[(\d+);(\d+)H")
+
+
+def painted_cells(segment: str) -> set[tuple[int, int]]:
+    """Return the zero-based (row, column) cells an ANSI segment writes."""
+    cells: set[tuple[int, int]] = set()
+    matches = list(_CELL_POSITION.finditer(segment))
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(segment)
+        row = int(match.group(1)) - 1
+        column = int(match.group(2)) - 1
+        text = _ANSI_SEQUENCE.sub("", segment[match.end() : end])
+        cells.update((row, column + offset) for offset in range(len(text)))
+    return cells
+
+
+def full_cells(width: int, height: int) -> set[tuple[int, int]]:
+    """Every cell of a ``width`` x ``height`` screen."""
+    return {(row, column) for row in range(height) for column in range(width)}
+
+
+class ScriptedSize:
+    """Hands the loop one geometry per call, repeating the last one forever."""
+
+    def __init__(self, *sizes: tuple[int, int]) -> None:
+        self.sizes = [tuple(size) for size in sizes]
+        self.calls = 0
+
+    def __call__(self, fallback: object = None) -> os.terminal_size:
+        size = self.sizes[min(self.calls, len(self.sizes) - 1)]
+        self.calls += 1
+        return os.terminal_size(size)
+
+
+class FakeLive:
+    """A subscription stand-in that never has anything to push."""
+
+    def poll(self, timeout: float):
+        return None
+
+
+def scripted_reader(*presses: str, on_read=None):
+    """A ``terminal_session`` stand-in that replays scripted key presses.
+
+    ``on_read`` receives ``(call_number, on_resize)`` so a test can trip the
+    resize callback from inside the loop.
+    """
+
+    @contextlib.contextmanager
+    def factory(*, on_resize=None):
+        queue = list(presses)
+        calls = 0
+
+        def read(timeout: float) -> str | None:
+            nonlocal calls
+            calls += 1
+            if on_read is not None:
+                on_read(calls, on_resize)
+            return queue.pop(0) if queue else None
+
+        yield read
+
+    return factory
 
 
 class TestScreen:
@@ -275,6 +349,10 @@ class TestDashboard:
         assert "q detach" in row
         assert FIRST_RUN_TIP not in row
 
+    def test_footer_hint_mentions_the_refresh_key(self):
+        screen = Dashboard().render(sample_model())
+        assert "ctrl-l refresh" in screen.text_at(screen.height - 2)
+
     def test_verify_banner_wins_over_the_first_run_tip(self):
         model = sample_model(status={"ledger": {"records": 1}}, verify_banner="chain ok · 1 events")
         screen = Dashboard().render(model)
@@ -446,6 +524,27 @@ class TestTuiApp:
         text = "\n".join(screen.text_at(row) for row in range(screen.height))
         assert "inject a sample agent event" in text
 
+    def test_help_overlay_documents_the_refresh_key(self):
+        app = TuiApp("/tmp/x.sock")
+        app.handle_key("?", FakeClient())
+        screen = app.dashboard.render(app.model(width=100, height=30))
+        text = "\n".join(screen.text_at(row) for row in range(screen.height))
+        assert "Ctrl-L" in text
+        assert "full screen refresh" in text
+
+    def test_ctrl_l_requests_a_redraw_without_touching_state(self):
+        app = TuiApp("/tmp/x.sock")
+        client = FakeClient()
+        assert app.handle_key(REFRESH_KEY, client) is True
+        assert app.redraw_requested is True
+        assert client.emitted is None
+        assert app.message == ""
+        assert app.events == []
+        # The request is cleared exactly once, when the loop honours it.
+        assert app.take_redraw_request() is True
+        assert app.redraw_requested is False
+        assert app.take_redraw_request() is False
+
     def test_model_is_serializable_and_complete(self):
         app = TuiApp("/tmp/x.sock", workspace="/w")
         model = app.model(width=80, height=24)
@@ -462,7 +561,7 @@ class TestTuiLoopOverARealSocket:
         import contextlib as _contextlib
 
         @_contextlib.contextmanager
-        def factory():
+        def factory(*, on_resize=None):
             queue = list(presses)
 
             def read(timeout: float) -> str | None:
@@ -559,3 +658,181 @@ class TestTuiLoopOverARealSocket:
                 max_iterations=2,
             )
         assert code == 0
+
+
+class TestTuiLoopResizeAndRefresh:
+    """Headless proof that resize, SIGWINCH, and Ctrl-L repaint in full.
+
+    ``painted_cells`` decodes the ANSI the loop writes, so a suppressed cell
+    shows up as a hole in the repaint: these tests assert complete cell coverage
+    instead of merely spotting a clear-screen sequence.
+    """
+
+    SMALL = (60, 16)
+    LARGE = (100, 30)
+
+    def run_loop(self, app, factory, size_getter, *, iterations: int = 6, client=None) -> str:
+        output = io.StringIO()
+        code = app._loop(  # noqa: SLF001 - the documented test seam
+            FakeClient() if client is None else client,
+            FakeLive(),
+            reader_factory=factory,
+            output=output,
+            max_iterations=iterations,
+            size_getter=size_getter,
+        )
+        assert code == 0
+        return output.getvalue()
+
+    def test_geometry_change_clears_and_repaints_every_cell(self):
+        app = TuiApp("/tmp/x.sock")
+        sizes = ScriptedSize(self.SMALL, self.SMALL, self.LARGE, self.SMALL, self.SMALL)
+        rendered = self.run_loop(app, scripted_reader(), sizes)
+
+        # The entry clear plus one clear for each geometry change (small -> large
+        # -> small). A resize must never fall back to an incremental diff.
+        assert rendered.count(CLEAR_SCREEN) == 3
+        segments = rendered.split(CLEAR_SCREEN)
+        assert painted_cells(segments[2]) == full_cells(*self.LARGE)
+        assert painted_cells(segments[3]) == full_cells(*self.SMALL)
+
+        # Cells that are identical across the two geometries are exactly the ones
+        # a stale cache would suppress. Prove the scenario is real, then prove
+        # they are written anyway.
+        before = app.dashboard.render(app.model(width=self.SMALL[0], height=self.SMALL[1]))
+        after = app.dashboard.render(app.model(width=self.LARGE[0], height=self.LARGE[1]))
+        unchanged = {
+            (row, column)
+            for row in range(before.height)
+            for column in range(before.width)
+            if before.cells[row][column] == after.cells[row][column]
+        }
+        assert unchanged, "the fixture must keep some cells identical across a resize"
+        assert unchanged <= painted_cells(segments[2])
+
+    def test_stable_geometry_keeps_incremental_diffs(self):
+        app = TuiApp("/tmp/x.sock")
+        rendered = self.run_loop(app, scripted_reader(), ScriptedSize(self.LARGE))
+
+        # An unchanged viewport must not clear on every iteration.
+        assert rendered.count(CLEAR_SCREEN) == 1
+        segments = rendered.split(CLEAR_SCREEN)
+        assert painted_cells(segments[1]) == full_cells(*self.LARGE)
+        # The first frame paints row 0 from its first column exactly once: the
+        # idle iterations that follow emit nothing at all.
+        assert segments[1].count("\x1b[1;1H") == 1
+
+    def test_ctrl_l_forces_a_full_repaint_of_an_unchanged_model(self):
+        app = TuiApp("/tmp/x.sock")
+        client = FakeClient()
+        rendered = self.run_loop(
+            app,
+            scripted_reader(REFRESH_KEY, "q"),
+            ScriptedSize(self.LARGE),
+            client=client,
+        )
+
+        assert rendered.count(CLEAR_SCREEN) == 2
+        segments = rendered.split(CLEAR_SCREEN)
+        assert painted_cells(segments[2]) == full_cells(*self.LARGE)
+        # Ctrl-L repaints only: no model change, no ledger write, no detach.
+        assert client.emitted is None
+        assert app.events == []
+        assert app.selection == 0
+        assert app.message == ""
+        assert app.paused is False
+        assert app.help is False
+        assert app.redraw_requested is False
+
+    def test_one_redraw_request_clears_exactly_once(self):
+        app = TuiApp("/tmp/x.sock")
+
+        def on_read(call: int, on_resize) -> None:
+            if call == 2:
+                on_resize()
+
+        # The geometry never changes, so the extra clear can only come from the
+        # resize callback that SIGWINCH would trip in production.
+        rendered = self.run_loop(app, scripted_reader(on_read=on_read), ScriptedSize(self.LARGE))
+
+        assert rendered.count(CLEAR_SCREEN) == 2
+        segments = rendered.split(CLEAR_SCREEN)
+        assert painted_cells(segments[2]) == full_cells(*self.LARGE)
+        assert app.redraw_requested is False, "a consumed request must be cleared"
+
+    def test_resize_and_sigwinch_together_clear_once(self):
+        app = TuiApp("/tmp/x.sock")
+
+        def on_read(call: int, on_resize) -> None:
+            if call == 1:
+                on_resize()  # SIGWINCH lands in the same iteration as the resize
+
+        sizes = ScriptedSize(self.LARGE, self.LARGE, self.SMALL, self.SMALL)
+        rendered = self.run_loop(app, scripted_reader(on_read=on_read), sizes)
+
+        # Entry clear plus exactly one clear for the combined event: the request
+        # must be consumed even when the geometry check already tripped.
+        assert rendered.count(CLEAR_SCREEN) == 2
+        segments = rendered.split(CLEAR_SCREEN)
+        assert painted_cells(segments[2]) == full_cells(*self.SMALL)
+        assert app.redraw_requested is False
+
+    def test_alternate_screen_and_cursor_lifecycle_is_preserved(self):
+        app = TuiApp("/tmp/x.sock")
+        sizes = ScriptedSize(self.SMALL, self.SMALL, self.LARGE, self.SMALL, self.SMALL)
+        rendered = self.run_loop(app, scripted_reader(), sizes)
+
+        assert rendered.count("\x1b[?1049h") == 1
+        assert rendered.count("\x1b[?1049l") == 1
+        assert rendered.count("\x1b[?25l") == 1
+        assert rendered.count("\x1b[?25h") == 1
+        assert rendered.index("\x1b[?1049h") < rendered.index("\x1b[?25l")
+        assert rendered.rstrip().endswith("\x1b[?25h\x1b[?1049l")
+
+    def test_sigwinch_requests_a_redraw_and_is_restored(self):
+        winch = getattr(signal, "SIGWINCH", None)
+        if winch is None:
+            pytest.skip("SIGWINCH is unavailable on this platform")
+        app = TuiApp("/tmp/x.sock")
+        original = signal.getsignal(winch)
+        with terminal_session(on_resize=app.request_redraw):
+            installed = signal.getsignal(winch)
+            assert installed is not original
+            installed(winch, None)  # the handler must only request a redraw
+            assert app.redraw_requested is True
+        assert signal.getsignal(winch) is original
+
+    def test_real_sigwinch_reaches_the_handler(self):
+        winch = getattr(signal, "SIGWINCH", None)
+        if winch is None:
+            pytest.skip("SIGWINCH is unavailable on this platform")
+        app = TuiApp("/tmp/x.sock")
+        with terminal_session(on_resize=app.request_redraw) as read_key:
+            assert read_key(0.0) is None
+            os.kill(os.getpid(), winch)
+            deadline = time.monotonic() + 1.0
+            while not app.redraw_requested and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert app.redraw_requested is True
+            # The self-pipe must drain, so the reader keeps blocking normally.
+            assert read_key(0.0) is None
+
+    def test_sigwinch_handler_is_restored_after_an_error(self):
+        winch = getattr(signal, "SIGWINCH", None)
+        if winch is None:
+            pytest.skip("SIGWINCH is unavailable on this platform")
+        original = signal.getsignal(winch)
+        with pytest.raises(RuntimeError):
+            with terminal_session(on_resize=lambda: None):
+                raise RuntimeError("boom")
+        assert signal.getsignal(winch) is original
+
+    def test_terminal_session_without_a_callback_leaves_sigwinch_alone(self):
+        winch = getattr(signal, "SIGWINCH", None)
+        if winch is None:
+            pytest.skip("SIGWINCH is unavailable on this platform")
+        original = signal.getsignal(winch)
+        with terminal_session() as read_key:
+            assert signal.getsignal(winch) is original
+            assert callable(read_key)
+        assert signal.getsignal(winch) is original

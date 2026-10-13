@@ -24,8 +24,9 @@ from __future__ import annotations
 import contextlib
 import io
 import os
-import shutil
 import select
+import shutil
+import signal
 import sys
 import termios
 import time
@@ -52,6 +53,13 @@ STYLES: dict[str, str] = {
     "generic": "\x1b[38;5;245m",
 }
 RESET = "\x1b[0m"
+
+#: Wipe the screen and park the cursor at the home position. Written whenever
+#: the physical screen may no longer match the cells we believe are on it.
+CLEAR_SCREEN = "\x1b[2J\x1b[H"
+
+#: Ctrl-L: repaint the screen without touching the model or the ledger.
+REFRESH_KEY = "\x0c"
 
 KIND_STYLE = {
     "signal": "signal",
@@ -233,6 +241,7 @@ HELP_LINES = (
     "  s            inject a sample agent event",
     "  v            verify the ledger hash chain",
     "  b            reap expired work leases",
+    "  Ctrl-L       force a full screen refresh",
     "  ?            close this help",
 )
 
@@ -245,7 +254,9 @@ FIRST_RUN_RECORDS = 2
 SAMPLE_TOPIC = "quay/demo"
 SAMPLE_PRODUCER = "quay"
 
-HINT_LINE = " q detach  ↑↓ move  space pause  f filter  1-5 kind  d detail  s sample  v verify  b reap  ? help"
+#: Kept under 100 columns so the tail stays visible on a narrow terminal; the
+#: help overlay lists the full set of keys, including the detail toggle.
+HINT_LINE = " q detach  ↑↓ move  space pause  f filter  1-5  s sample  v verify  b reap  ctrl-l refresh  ? help"
 
 
 class Dashboard:
@@ -441,6 +452,7 @@ class TuiApp:
         self.dropped = 0
         self.status: dict[str, Any] = {}
         self.health: dict[str, Any] = {}
+        self.redraw_requested = False
 
     # ------------------------------------------------------------------ model
 
@@ -492,6 +504,24 @@ class TuiApp:
         self.events = [dict(event) for event in events]
         self.selection = 0
 
+    # ------------------------------------------------------------------ redraw
+
+    def request_redraw(self) -> None:
+        """Ask the loop to clear the screen and repaint every cell.
+
+        Both the SIGWINCH handler and the Ctrl-L binding funnel through here, so
+        the request path stays cheap and free of terminal I/O and of model
+        changes. The loop honours it on its next iteration.
+        """
+        self.redraw_requested = True
+
+    def take_redraw_request(self) -> bool:
+        """Consume a pending redraw request, clearing it only once honoured."""
+        if not self.redraw_requested:
+            return False
+        self.redraw_requested = False
+        return True
+
     def handle_key(self, key: str, client) -> bool:
         """Apply one key press. Returns False when the UI should exit."""
         if key in ("q", "\x03"):
@@ -523,6 +553,9 @@ class TuiApp:
             self.run_verify(client)
         elif key == "b":
             self.run_reap(client)
+        elif key == REFRESH_KEY:
+            # Ctrl-L: repaint only. No model change, no ledger event.
+            self.request_redraw()
         return True
 
     def run_sample(self, client) -> None:
@@ -590,25 +623,44 @@ class TuiApp:
         reader_factory=None,
         output=None,
         max_iterations: int | None = None,
+        size_getter=None,
     ) -> int:
         """Render until the user detaches.
 
-        ``reader_factory``, ``output``, and ``max_iterations`` exist so the loop
-        can be driven headlessly in tests; production always passes the real
-        terminal session and stdout.
+        ``reader_factory``, ``output``, ``max_iterations``, and ``size_getter``
+        exist so the loop can be driven headlessly in tests; production always
+        passes the real terminal session and stdout.
         """
         stream = output if output is not None else sys.stdout
         factory = reader_factory or terminal_session
-        size = shutil.get_terminal_size(fallback=(100, 30))
+        get_size = size_getter or shutil.get_terminal_size
+        size = get_size(fallback=(100, 30))
+        # The geometry is tracked separately from ``previous``: the cell cache
+        # only describes frames we drew, while the terminal may have cleared or
+        # reflowed the screen behind our back.
+        last_geometry = (size.columns, size.lines)
         previous: list[list[tuple[str, str]]] | None = None
         last_status = 0.0
         iterations = 0
-        with factory() as reader:
+        with factory(on_resize=self.request_redraw) as reader:
             write = stream.write
-            write("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l")
+            write(f"\x1b[?1049h{CLEAR_SCREEN}\x1b[?25l")
             try:
                 while True:
-                    size = shutil.get_terminal_size(fallback=size)
+                    size = get_size(fallback=size)
+                    geometry = (size.columns, size.lines)
+                    # Always consume the request: a resize and SIGWINCH often
+                    # arrive together, and a lingering flag would repaint twice.
+                    redraw_requested = self.take_redraw_request()
+                    if geometry != last_geometry or redraw_requested:
+                        # The viewport changed, or the user/SIGWINCH asked for a
+                        # repaint. tmux and the terminal emulator clear or
+                        # reflow on resize, so every cached cell is suspect:
+                        # wipe the screen and force a full paint instead of
+                        # letting render_diff suppress "unchanged" cells.
+                        last_geometry = geometry
+                        write(CLEAR_SCREEN)
+                        previous = None
                     now = time.monotonic()
                     if now - last_status >= self.refresh_seconds:
                         with contextlib.suppress(Exception):
@@ -661,11 +713,16 @@ class TuiApp:
 
 
 @contextlib.contextmanager
-def terminal_session():
+def terminal_session(*, on_resize=None):
     """Put the terminal in cbreak mode and yield a non-blocking key reader.
 
     Falls back to a no-op when stdin is not a terminal (pipes, test runners),
     where every read simply reports "no key".
+
+    When ``on_resize`` is supplied and the platform provides ``SIGWINCH``, a
+    narrowly scoped handler asks the app for a redraw and nudges the blocking
+    reader awake through a self-pipe. The handler performs no terminal I/O, and
+    the previous handler is restored on every exit path.
     """
     try:
         stdin = sys.stdin.fileno()
@@ -679,14 +736,46 @@ def terminal_session():
         except (termios.error, ValueError, OSError):
             saved = None
 
+    wake_read: int | None = None
+    wake_write: int | None = None
+    winch = getattr(signal, "SIGWINCH", None)
+    previous_handler = None
+    if on_resize is not None and winch is not None:
+        try:
+            wake_read, wake_write = os.pipe()
+            os.set_blocking(wake_read, False)
+            os.set_blocking(wake_write, False)
+        except (OSError, AttributeError):  # pragma: no cover - exotic platforms
+            wake_read = wake_write = None
+
+        def _on_winch(_signum, _frame) -> None:
+            on_resize()
+            if wake_write is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    os.write(wake_write, b"\x00")
+
+        try:
+            previous_handler = signal.getsignal(winch)
+            signal.signal(winch, _on_winch)
+        except (OSError, ValueError, RuntimeError):
+            # Signals can only be trapped from the main thread; a worker thread
+            # keeps the polling reader and simply misses the prompt wakeup.
+            previous_handler = None
+
     def read_key(timeout: float) -> str | None:
         if stdin is None:
             time.sleep(min(timeout, 0.05))
             return None
+        watched = [stdin] if wake_read is None else [stdin, wake_read]
         try:
-            ready, _, _ = select.select([stdin], [], [], timeout)
+            ready, _, _ = select.select(watched, [], [], timeout)
         except (OSError, ValueError):
             return None
+        if wake_read is not None and wake_read in ready:
+            with contextlib.suppress(OSError, ValueError):
+                os.read(wake_read, 4096)
+            if stdin not in ready:
+                return None
         if not ready:
             return None
         try:
@@ -697,6 +786,13 @@ def terminal_session():
     try:
         yield read_key
     finally:
+        if previous_handler is not None and winch is not None:
+            with contextlib.suppress(OSError, ValueError):
+                signal.signal(winch, previous_handler)
+        for descriptor in (wake_read, wake_write):
+            if descriptor is not None:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
         if saved is not None:
             with contextlib.suppress(termios.error, ValueError, OSError):
                 termios.tcsetattr(stdin, termios.TCSADRAIN, saved)
