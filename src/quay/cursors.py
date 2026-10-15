@@ -149,6 +149,21 @@ class CursorStore:
             "in_flight": row.get("in_flight"),
         }
 
+    def register(self, consumer: str) -> dict[str, Any]:
+        """Persist a durable consumer at sequence zero if it is not registered."""
+        name = self._consumer(consumer)
+        with self._locked(exclusive=True):
+            rows = self._load_unlocked()
+            current = rows.get(name)
+            if current is None:
+                current = {"last_acked_seq": 0, "in_flight": None}
+                rows[name] = current
+                self._write_unlocked(rows)
+            return {
+                "last_acked_seq": int(current.get("last_acked_seq", 0)),
+                "in_flight": current.get("in_flight"),
+            }
+
     def begin_delivery(
         self,
         consumer: str,

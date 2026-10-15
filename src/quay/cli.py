@@ -30,7 +30,7 @@ from . import __version__
 from .client import ClientError, QuayClient, SubscriptionStream
 from .daemon import all_daemon_status, daemon_health, ensure_daemon, stop_daemon
 from .onboarding import onboard
-from .store import StoreError
+from .store import LedgerStore, StoreError, utc_now
 from .tui import TuiApp
 from .workspace import (
     STATE_DIRECTORY,
@@ -167,9 +167,26 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--no-json", action="store_true", dest="no_json", default=argparse.SUPPRESS)
     common.add_argument("--timeout", type=float, default=argparse.SUPPRESS)
 
-    init_parser = subparsers.add_parser("init", parents=[common], help="prepare a workspace and show the Git advisory")
-    init_parser.add_argument("--git-ignore", action="store_true", help="preview adding .quay/ to .gitignore")
-    init_parser.add_argument("--yes", action="store_true", help="apply the previewed .gitignore change")
+    init_parser = subparsers.add_parser(
+        "init", parents=[common], help="initialize the runtime ledger and tracked OKF knowledge plane"
+    )
+    init_parser.add_argument(
+        "--bare", action="store_true", help="initialize runtime state without tracked OKF files"
+    )
+    # Retained as compatibility no-ops: explicit init now ignores .quay/ safely by default.
+    init_parser.add_argument("--git-ignore", action="store_true", help=argparse.SUPPRESS)
+    init_parser.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
+
+    distill = subparsers.add_parser(
+        "distill", parents=[common], help="materialize acknowledged handoffs into bounded OKF files"
+    )
+    output = distill.add_mutually_exclusive_group()
+    output.add_argument("--stdout", action="store_true", help="render Markdown without writing files")
+    output.add_argument("--out", default=None, help="knowledge-plane output root (default: okf/)")
+    distill.add_argument(
+        "--force-worktree", action="store_true", help="allow writes from a linked Git worktree"
+    )
+    distill.add_argument("--limit", type=int, default=100, help="maximum handoffs per run (1-1000)")
 
     start = subparsers.add_parser("start", parents=[common], help="start the daemon for this workspace")
     start.add_argument("--idle-seconds", type=float, default=None, help="idle shutdown timeout (0 disables)")
@@ -279,37 +296,102 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
+    from .cursors import CursorStore
+    from .scaffold import ensure_runtime_ignored, scaffold_workspace
+
     json_mode = _json_mode(args)
-    root = workspace_path(args)
+    root = workspace_path(args, create=False)
+    scaffold_time = utc_now()
+    try:
+        existing_paths = paths_for(root, create=False)
+        existing_ledger = LedgerStore(existing_paths.database, create=False, synchronous="NORMAL")
+    except (WorkspaceError, StoreError) as exc:
+        if getattr(exc, "code", None) not in ("no_state", "no_ledger"):
+            raise
+    else:
+        try:
+            scaffold_time = existing_ledger.meta("created_at") or scaffold_time
+        finally:
+            existing_ledger.close()
+    if not args.bare:
+        scaffold_workspace(root, generated_at=scaffold_time, check_only=True)
     paths = paths_for(root, create=True)
+    ledger = LedgerStore(paths.database, synchronous="NORMAL")
+    created_at = ledger.meta("created_at")
+    ledger.close()
+    # Prefer the ledger's persisted creation time. On a new ledger it differs
+    # from the preflight time only by milliseconds; no files exist yet.
+    scaffold_time = created_at or scaffold_time
+    scaffold = (
+        {
+            "template_version": None,
+            "manifest": None,
+            "created": [],
+            "unchanged": [],
+            "conflicts": [],
+            "bare": True,
+        }
+        if args.bare
+        else {**scaffold_workspace(paths.workspace, generated_at=scaffold_time), "bare": False}
+    )
+    if not args.bare:
+        CursorStore(paths.root).register("quay.distill")
+    ignore = ensure_runtime_ignored(root, bare=bool(args.bare))
     advisory = git_advisory(root)
-    applied = False
-    if args.git_ignore:
-        target = root / ".gitignore"
-        before = target.read_text(encoding="utf-8") if target.exists() else ""
-        if f"{STATE_DIRECTORY}/" in before.splitlines():
-            advisory = f"'{STATE_DIRECTORY}/' is already ignored"
-        elif not args.yes:
-            advisory = (
-                f"would append '{STATE_DIRECTORY}/' to {target}; rerun with --yes to apply"
-            )
-        else:
-            suffix = "" if not before or before.endswith("\n") else "\n"
-            target.write_text(before + suffix + f"{STATE_DIRECTORY}/\n", encoding="utf-8")
-            applied = True
-            advisory = f"appended '{STATE_DIRECTORY}/' to {target}"
     result = {
         "workspace": str(root),
         "state_dir": str(paths.root),
         "ledger": str(paths.database),
         "socket": str(paths.socket),
         "git_advisory": advisory,
-        "git_ignore_applied": applied,
+        "git_ignore_applied": ignore["applied"],
+        "git_ignore": ignore,
+        "scaffold": scaffold,
     }
     human = f"workspace ready: {paths.root}"
+    if scaffold["bare"]:
+        human += "\nknowledge scaffold skipped (--bare)"
+    else:
+        human += f"\nscaffold: {len(scaffold['created'])} created, {len(scaffold['unchanged'])} unchanged"
+    if ignore["path"]:
+        verb = "updated" if ignore["applied"] else "already configured"
+        human += f"\n{verb}: {ignore['path']}"
     if advisory:
         human += f"\n{advisory}"
     emit_result(result, json_mode=json_mode, human=human)
+    return EXIT_OK
+
+
+def cmd_distill(args: argparse.Namespace) -> int:
+    from .distill import distill_workspace
+
+    root = workspace_path(args, create=False)
+    output_root = None
+    if args.out is not None:
+        candidate = Path(args.out).expanduser()
+        output_root = candidate if candidate.is_absolute() else root / candidate
+    result = distill_workspace(
+        root,
+        output_root=output_root,
+        stdout=bool(args.stdout),
+        force_worktree=bool(args.force_worktree),
+        limit=int(args.limit),
+    )
+    if args.stdout:
+        for index, document in enumerate(result.pop("documents")):
+            if index:
+                sys.stdout.write("\n")
+            sys.stdout.write(document)
+        sys.stdout.flush()
+        return EXIT_OK
+    emit_result(
+        result,
+        json_mode=_json_mode(args),
+        human=(
+            f"distilled {result['count']} handoff(s) through seq {result['high_water_seq']} "
+            f"into {result['output_root']}"
+        ),
+    )
     return EXIT_OK
 
 
@@ -844,6 +926,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
 
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
     "init": cmd_init,
+    "distill": cmd_distill,
     "start": cmd_start,
     "stop": cmd_stop,
     "restart": cmd_restart,

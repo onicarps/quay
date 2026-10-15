@@ -14,6 +14,14 @@ from quay.cursors import CursorStore
 from quay.store import StoreError
 
 
+def test_register_is_durable_and_idempotent(tmp_path: Path):
+    cursors = CursorStore(tmp_path / ".quay")
+
+    assert cursors.register("quay.distill") == {"last_acked_seq": 0, "in_flight": None}
+    assert cursors.register("quay.distill") == {"last_acked_seq": 0, "in_flight": None}
+    assert cursors.minimum_acked_seq() == 0
+
+
 def test_one_outstanding_delivery_is_atomic_and_idempotent(tmp_path: Path):
     cursors = CursorStore(tmp_path / ".quay")
     first = cursors.begin_delivery("codex", 7, "quay:ledger:7")

@@ -16,7 +16,10 @@ from pathlib import Path
 import pytest
 
 from quay import __version__, cli
+from quay.cursors import CursorStore
 from quay.daemon import stop_daemon
+from quay.store import LedgerStore
+from quay.workspace import WorkspaceError, paths_for
 
 
 @pytest.fixture()
@@ -301,21 +304,138 @@ class TestInit:
         assert payload["ledger"].endswith("ledger.db")
         assert payload["git_advisory"] is None
 
-    def test_init_git_ignore_preview_then_apply(self, run, ws):
+    def test_init_scaffolds_and_git_ignores_by_default(self, run, ws):
         subprocess.run(["git", "init", "-q", str(ws)], check=True)
-        preview = as_json(run("init", "--git-ignore")[1])
-        assert preview["git_ignore_applied"] is False
-        assert "would append" in preview["git_advisory"]
-
-        applied = as_json(run("init", "--git-ignore", "--yes")[1])
+        applied = as_json(run("init")[1])
         assert applied["git_ignore_applied"] is True
         assert ".quay/" in (ws / ".gitignore").read_text(encoding="utf-8")
+        assert (ws / "AGENTS.md").is_file()
+        assert (ws / "okf/.scaffold-manifest.json").is_file()
+        assert CursorStore(paths_for(ws).root).get("quay.distill") == {
+            "last_acked_seq": 0,
+            "in_flight": None,
+        }
 
-    def test_init_reports_the_git_advisory_when_unignored(self, run, ws):
+        repeated = as_json(run("init")[1])
+        assert repeated["git_ignore_applied"] is False
+        assert repeated["scaffold"]["created"] == []
+        assert len(repeated["scaffold"]["unchanged"]) == 8
+
+    def test_init_bare_uses_local_exclude_and_leaves_worktree_clean(self, run, ws):
         subprocess.run(["git", "init", "-q", str(ws)], check=True)
-        payload = as_json(run("init")[1])
-        assert payload["git_advisory"] is not None
-        assert ".quay/" in payload["git_advisory"]
+        payload = as_json(run("init", "--bare")[1])
+        assert payload["scaffold"]["bare"] is True
+        assert payload["git_ignore"]["scope"] == "git-info-exclude"
+        assert not (ws / "okf").exists()
+        assert not (ws / "AGENTS.md").exists()
+        status = subprocess.run(
+            ["git", "status", "--short"], cwd=ws, check=True, capture_output=True, text=True
+        )
+        assert status.stdout == ""
+
+    def test_init_conflict_does_not_create_runtime_or_modify_git_files(self, run, ws):
+        subprocess.run(["git", "init", "-q", str(ws)], check=True)
+        (ws / "AGENTS.md").write_text("team-owned\n", encoding="utf-8")
+
+        code, _out, err = run("init")
+
+        assert code == 2
+        assert as_json(err)["error"]["code"] == "scaffold_conflict"
+        assert (ws / "AGENTS.md").read_text(encoding="utf-8") == "team-owned\n"
+        assert not (ws / ".quay").exists()
+        assert not (ws / ".gitignore").exists()
+
+    def test_init_subdirectory_conflict_is_checked_before_side_effects(
+        self, run, ws, monkeypatch
+    ):
+        subprocess.run(["git", "init", "-q", str(ws)], check=True)
+        nested = ws / "nested"
+        nested.mkdir()
+        (nested / "AGENTS.md").write_text("team-owned\n", encoding="utf-8")
+        monkeypatch.chdir(nested)
+
+        code, _out, err = run("init")
+
+        assert code == 2
+        assert as_json(err)["error"]["code"] == "scaffold_conflict"
+        assert (nested / "AGENTS.md").read_text(encoding="utf-8") == "team-owned\n"
+        assert not (nested / ".quay").exists()
+        assert not (ws / ".quay").exists()
+        assert not (ws / ".gitignore").exists()
+
+    def test_init_scaffold_write_failure_does_not_modify_git_files(
+        self, run, ws, monkeypatch
+    ):
+        from quay import scaffold as scaffold_module
+
+        subprocess.run(["git", "init", "-q", str(ws)], check=True)
+        original = scaffold_module.scaffold_workspace
+
+        def fail_write(*args, **kwargs):
+            if kwargs.get("check_only"):
+                return original(*args, **kwargs)
+            raise WorkspaceError("scaffold_race", "injected scaffold write failure")
+
+        monkeypatch.setattr(scaffold_module, "scaffold_workspace", fail_write)
+
+        code, _out, err = run("init")
+
+        assert code == 2
+        assert as_json(err)["error"]["code"] == "scaffold_race"
+        assert not (ws / "AGENTS.md").exists()
+        assert not (ws / ".gitignore").exists()
+
+
+class TestDistill:
+    def test_distill_command_materializes_acknowledged_handoff(self, run, ws):
+        subprocess.run(["git", "init", "-q", str(ws)], check=True)
+        assert run("init")[0] == 0
+        paths = paths_for(ws)
+        store = LedgerStore(paths.database, synchronous="NORMAL")
+        try:
+            event = store.append(
+                topic="swarm/codex/handoff",
+                producer="agy",
+                kind="handoff",
+                payload={"from": "agy", "to": "codex", "summary": "CLI distill"},
+            )
+        finally:
+            store.close()
+        cursors = CursorStore(paths.root)
+        cursors.begin_delivery("codex", event["seq"], "cli-distill")
+        cursors.acknowledge("codex", event["seq"], idempotency_key="cli-distill")
+
+        code, out, err = run("distill")
+
+        assert code == 0, err
+        payload = as_json(out)
+        assert payload["count"] == 1
+        assert payload["high_water_seq"] == event["seq"]
+        assert (ws / "okf" / payload["created"][0]).is_file()
+
+    def test_distill_stdout_is_markdown_only(self, run, ws):
+        subprocess.run(["git", "init", "-q", str(ws)], check=True)
+        assert run("init")[0] == 0
+        paths = paths_for(ws)
+        store = LedgerStore(paths.database, synchronous="NORMAL")
+        try:
+            event = store.append(
+                topic="swarm/codex/handoff",
+                producer="agy",
+                kind="handoff",
+                payload={"from": "agy", "to": "codex", "summary": "preview"},
+            )
+        finally:
+            store.close()
+        cursors = CursorStore(paths.root)
+        cursors.begin_delivery("codex", event["seq"], "cli-preview")
+        cursors.acknowledge("codex", event["seq"], idempotency_key="cli-preview")
+
+        code, out, err = run("distill", "--stdout")
+
+        assert code == 0, err
+        assert out.startswith("---\ntype: Handoff\n")
+        assert "preview" in out
 
 
 class TestWatch:
@@ -559,6 +679,7 @@ class TestUsageAndErrors:
         text = capsys.readouterr().out
         for command in (
             "init",
+            "distill",
             "start",
             "stop",
             "restart",

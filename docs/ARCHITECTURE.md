@@ -44,6 +44,8 @@ to be running.
 | `canonical.py` | Deterministic JSON encoding and the SHA-256 hash chain |
 | `schemas.py` | Envelope and payload contracts, state machines, `prepare_event` |
 | `store.py` | The ledger: append, query, projections, leases, verify, prune |
+| `scaffold.py` | Conflict-safe packaged OKF templates and Git ignore discipline |
+| `distill.py` | Deterministic acknowledged-handoff materialization and high-water state |
 | `protocol.py` | Frame encoding/decoding and request validation |
 | `server.py` | The daemon: connections, subscriptions, backpressure, ops |
 | `client.py` | Blocking client and `SubscriptionStream` |

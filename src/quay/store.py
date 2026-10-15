@@ -52,6 +52,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -332,6 +333,7 @@ class LedgerStore:
             self._set_meta_if_absent("checkpoint_seq", "0")
             self._set_meta_if_absent("checkpoint_hash", GENESIS_HASH)
             self._set_meta_if_absent("created_at", utc_now())
+            self._set_meta_if_absent("ledger_uuid", str(uuid.uuid4()))
             self._conn.commit()
         self._chmod_private(self.path)
 
@@ -618,6 +620,7 @@ class LedgerStore:
         return {
             "ledger": {
                 "path": str(self.path),
+                "uuid": self.meta("ledger_uuid"),
                 "format_version": int(self.meta("format_version") or 0),
                 "records": counters.get("record", 0),
                 "last_seq": int(last["seq"]) if last else 0,

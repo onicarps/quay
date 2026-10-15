@@ -1,0 +1,18 @@
+schema_version = 1
+
+# Add one [runner.<name>] table per local runner. The runtime wake and run directories
+# remain under .quay/; this tracked file is the reviewed configuration source of truth.
+[runner.example]
+enabled = false
+producer = "example"
+intake = "spool"
+accept_to = ["example"]
+allow_broadcast = false
+max_turns_per_chain = 10
+max_event_age_hours = 24
+wake_dir = ".quay/wake/example"
+runs_dir = ".quay/runs"
+ack_mode = "done-file"
+adapter = "command"
+adapter_command = "false"
+turn_timeout_seconds = 1800

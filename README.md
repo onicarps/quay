@@ -87,7 +87,7 @@ python3 -m quay.cli --help
 ```bash
 cd ~/my-project
 quay                            # create .quay/, start the daemon, open the cockpit
-quay init                       # explicit setup; only checks the Git advisory
+quay init                       # explicit setup: runtime ledger + tracked okf/ scaffold
 
 quay emit build/log '{"text": "compiled ok", "tags": ["build"]}' --kind note
 quay emit build/alert '{"summary": "disk almost full"}' --kind signal
@@ -98,8 +98,11 @@ quay status
 Point Quay at a folder and it does the setup itself: `quay [PATH]`, bare
 `quay`, and `quay monitor [PATH]` create `.quay/`, start (or reuse) the
 daemon, append `.quay/` to the enclosing worktree's `.gitignore`, and write a
-single genesis note. Nothing else changes outside that folder. `quay init`
-stays the explicit, preview-only path.
+single genesis note. Implicit onboarding never creates tracked knowledge files.
+Explicit `quay init` also creates `AGENTS.md` and a manifest-backed `okf/`
+knowledge plane, and appends `.quay/` to `.gitignore`. Use `quay init --bare`
+for ledger-only initialization; it uses `.git/info/exclude`, so the working
+tree stays clean.
 
 Payloads are validated per kind. A `note` carries `text` (plus optional
 `tags`), a `signal` carries `summary` and a state, a `metric` carries `name` and
@@ -138,6 +141,27 @@ pipeline:
 quay status | jq '.planes'
 ```
 
+### Repository knowledge plane
+
+Explicit `quay init` loads versioned templates from the installed package and
+writes each file atomically. A second run is a no-op. If an existing file is
+not byte-identical, initialization reports `scaffold_conflict` and does not
+overwrite it. `okf/.scaffold-manifest.json` records the template version and
+hash of every generated file.
+
+`quay distill` walks ledger sequence order from its stored high-water mark. A
+handoff is eligible only after the named cursor matching its `to` recipient has
+acknowledged that sequence; the first unacknowledged handoff is an ordering
+barrier, so later work is never silently skipped. Materialized concepts use
+stable `quay://<ledger-uuid>/events/<seq>` sources and live under
+`okf/handoffs/YYYY/MM/`; `okf/log.md` retains only the 50 most recent entries.
+The scaffold registers a durable `quay.distill` cursor, and the writer advances
+it only after the handoff files, bounded log, and high-water state are durable;
+pruning therefore cannot race ahead of knowledge materialization. The default
+writer runs only from the primary Git worktree. `--stdout` is a non-mutating
+preview, `--out DIR` selects another knowledge root, and `--force-worktree` is
+the explicit linked-worktree override.
+
 ## CLI reference
 
 Common flags on every command: `--workspace PATH` (default: the current
@@ -146,7 +170,8 @@ stdout is not a terminal; `--no-json` forces the human rendering.
 
 | Command | Purpose |
 | --- | --- |
-| `quay init [--git-ignore --yes]` | Create `.quay/`, report a Git advisory, optionally add the ignore line |
+| `quay init [--bare]` | Create the ledger and conflict-safe tracked OKF scaffold; `--bare` creates runtime state only |
+| `quay distill [--stdout \| --out DIR] [--force-worktree] [--limit N]` | Materialize acknowledged handoffs into partitioned, bounded OKF concepts |
 | `quay start [--idle-seconds N]` | Start this workspace's daemon (`0` disables idle shutdown) |
 | `quay stop [--all --yes]` | Stop this daemon, or every registered daemon |
 | `quay restart` | Stop and start |
