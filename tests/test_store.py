@@ -106,6 +106,105 @@ class TestAppendAndChain:
         assert body["payload"] == {"x": [1, 2]}
         assert event_digest(body["prev_hash"], body) == event["hash"]
 
+    def test_root_causation_is_validated_hash_bound_and_queryable(
+        self, store: LedgerStore, ledger_path: Path
+    ):
+        root = store.append(topic="turn/root", producer="agy", payload={})
+        child = store.append(
+            topic="turn/child",
+            producer="codex",
+            payload={"step": 1},
+            causation_id=root["seq"],
+            root_causation_id=root["seq"],
+        )
+
+        assert child["root_causation_id"] == root["seq"]
+        assert store.get(child["seq"])["root_causation_id"] == root["seq"]
+        assert store.query(root_causation_id=root["seq"]) == [child]
+        body = json.loads(
+            store._conn.execute(  # noqa: SLF001 - inspect durable canonical row
+                "SELECT body FROM events WHERE seq = ?", (child["seq"],)
+            ).fetchone()["body"]
+        )
+        assert body["root_causation_id"] == root["seq"]
+        connection = sqlite3.connect(ledger_path)
+        try:
+            indexes = {row[1] for row in connection.execute("PRAGMA index_list(events)")}
+        finally:
+            connection.close()
+        assert "idx_events_root_cause" in indexes
+        assert store.verify()["ok"] is True
+
+    @pytest.mark.parametrize("bad", [True, 0, -1, "1"])
+    def test_root_causation_validation_reaches_the_store(self, store: LedgerStore, bad):
+        with pytest.raises(StoreError) as excinfo:
+            store.append(
+                topic="turn/child",
+                producer="codex",
+                payload={},
+                root_causation_id=bad,
+            )
+        assert excinfo.value.code == "invalid_root_causation"
+        assert store.count() == 0
+
+    def test_root_causation_must_name_an_earlier_event(self, store: LedgerStore):
+        store.append(topic="turn/root", producer="agy", payload={})
+        with pytest.raises(StoreError) as forward:
+            store.append(
+                topic="turn/child",
+                producer="codex",
+                payload={},
+                root_causation_id=99,
+            )
+        assert forward.value.code == "invalid_root_causation"
+
+        with pytest.raises(StoreError) as self_reference:
+            store.append(
+                topic="turn/child",
+                producer="codex",
+                payload={},
+                root_causation_id=2,
+            )
+        assert self_reference.value.code == "invalid_root_causation"
+        assert store.count() == 1
+
+    def test_root_causation_rejects_a_missing_earlier_event(self, store: LedgerStore):
+        for index in range(3):
+            store.append(topic="turn/event", producer="agy", payload={"i": index})
+        store._conn.execute("DELETE FROM events WHERE seq = 2")  # noqa: SLF001
+        store._conn.commit()  # noqa: SLF001
+
+        with pytest.raises(StoreError) as excinfo:
+            store.append(
+                topic="turn/child",
+                producer="codex",
+                payload={},
+                root_causation_id=2,
+            )
+        assert excinfo.value.code == "unknown_root_causation"
+
+    def test_root_causation_must_follow_the_parent_lineage(self, store: LedgerStore):
+        first_root = store.append(topic="turn/root", producer="agy", payload={})
+        second_root = store.append(topic="turn/root", producer="agy", payload={})
+        parent = store.append(
+            topic="turn/parent",
+            producer="codex",
+            payload={},
+            causation_id=first_root["seq"],
+            root_causation_id=first_root["seq"],
+        )
+
+        with pytest.raises(StoreError) as excinfo:
+            store.append(
+                topic="turn/child",
+                producer="factory",
+                payload={},
+                causation_id=parent["seq"],
+                root_causation_id=second_root["seq"],
+            )
+        assert excinfo.value.code == "root_causation_mismatch"
+        assert store.count() == 3
+
     def test_store_owned_fields_are_rejected(self, store: LedgerStore):
         for field in ("seq", "hash", "prev_hash", "event_id"):
             with pytest.raises(StoreError) as excinfo:
@@ -186,7 +285,13 @@ class TestReadsAndQuery:
         store.append(
             topic="okf/handoff",
             producer="codex",
-            payload={"key": "b", "executor": "codex", "state": "done", "evidence": {"commit": "c1"}},
+            payload={
+                "key": "b",
+                "executor": "codex",
+                "state": "done",
+                "evidence": {"commit": "c1"},
+                "fencing_token": 1,
+            },
             kind="work",
             causation_id=2,
         )
@@ -621,3 +726,180 @@ class TestLifecycle:
         store.vacuum()
         assert store.count() == 5
         assert store.verify()["ok"] is True
+
+
+def _columns(path: Path, table: str) -> set[str]:
+    connection = sqlite3.connect(str(path))
+    try:
+        return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+    finally:
+        connection.close()
+
+
+class TestWorkFencingStorage:
+    """The fencing token is durable, hashed, migrated, and rebuilt (Phase 1A)."""
+
+    def test_fresh_works_table_declares_the_fencing_column(self, ledger_path: Path):
+        store = LedgerStore(ledger_path, synchronous="NORMAL")
+        try:
+            assert "fencing_token" in _columns(ledger_path, "works")
+        finally:
+            store.close()
+
+    @pytest.mark.skipif(
+        sqlite3.sqlite_version_info < (3, 35, 0),
+        reason="simulating a pre-root-causation ledger needs ALTER TABLE ... DROP COLUMN",
+    )
+    def test_a_legacy_ledger_adds_the_root_causation_column_and_index(
+        self, ledger_path: Path
+    ):
+        initial = LedgerStore(ledger_path, synchronous="NORMAL")
+        initial.close()
+        connection = sqlite3.connect(ledger_path)
+        connection.execute("DROP INDEX idx_events_root_cause")
+        connection.execute("ALTER TABLE events DROP COLUMN root_causation_id")
+        connection.commit()
+        connection.close()
+
+        reopened = LedgerStore(ledger_path, synchronous="NORMAL")
+        try:
+            assert "root_causation_id" in _columns(ledger_path, "events")
+            indexes = {
+                row[1]
+                for row in reopened._conn.execute(  # noqa: SLF001
+                    "PRAGMA index_list(events)"
+                )
+            }
+            assert "idx_events_root_cause" in indexes
+        finally:
+            reopened.close()
+
+    def test_claim_token_is_bound_into_the_event_hash(self, store: LedgerStore, ledger_path: Path):
+        claim = store.append(
+            topic="work/queue",
+            producer="factory",
+            payload={"key": "k", "executor": "factory", "state": "claimed"},
+            kind="work",
+        )
+        assert claim["payload"]["fencing_token"] == 1
+        assert store.get(claim["seq"])["payload"]["fencing_token"] == 1
+
+        store.close()
+        connection = sqlite3.connect(ledger_path)
+        row = connection.execute(
+            "SELECT payload, body FROM events WHERE seq = ?", (claim["seq"],)
+        ).fetchone()
+        assert json.loads(row[0])["fencing_token"] == 1
+        assert '"fencing_token":1' in row[1], "the token must be inside the hashed body"
+        # Rewriting the stored token is a tamper the chain must catch.
+        connection.execute(
+            "UPDATE events SET payload = ? WHERE seq = ?",
+            (row[0].replace('"fencing_token":1', '"fencing_token":9'), claim["seq"]),
+        )
+        connection.commit()
+        connection.close()
+        reopened = LedgerStore(ledger_path)
+        try:
+            report = reopened.verify()
+            assert report["ok"] is False
+            assert report["divergence"]["reason"] in ("hash_mismatch", "body_column_mismatch")
+        finally:
+            reopened.close()
+
+    def test_reopening_preserves_the_fencing_token(self, ledger_path: Path):
+        store = LedgerStore(ledger_path, synchronous="NORMAL")
+        try:
+            claim = store.append(
+                topic="work/queue",
+                producer="factory",
+                payload={"key": "k", "executor": "factory", "state": "claimed"},
+                kind="work",
+            )
+            assert claim["payload"]["fencing_token"] == 1
+        finally:
+            store.close()
+        reopened = LedgerStore(ledger_path, synchronous="NORMAL")
+        try:
+            assert reopened.list_work()[0]["fencing_token"] == 1
+            assert reopened.verify()["ok"] is True
+        finally:
+            reopened.close()
+
+    @pytest.mark.skipif(
+        sqlite3.sqlite_version_info < (3, 35, 0),
+        reason="simulating a pre-fencing ledger needs ALTER TABLE ... DROP COLUMN",
+    )
+    def test_a_ledger_without_the_column_is_migrated_in_place(self, ledger_path: Path):
+        store = LedgerStore(ledger_path, synchronous="NORMAL")
+        try:
+            claim = store.append(
+                topic="work/queue",
+                producer="factory",
+                payload={"key": "k", "executor": "factory", "state": "claimed", "lease_seconds": 60},
+                kind="work",
+            )
+            assert claim["payload"]["fencing_token"] == 1
+        finally:
+            store.close()
+
+        connection = sqlite3.connect(str(ledger_path))
+        connection.execute("ALTER TABLE works DROP COLUMN fencing_token")
+        connection.commit()
+        connection.close()
+        assert "fencing_token" not in _columns(ledger_path, "works")
+
+        reopened = LedgerStore(ledger_path, synchronous="NORMAL")
+        try:
+            assert "fencing_token" in _columns(ledger_path, "works")
+            # The migration backfills DEFAULT 1, so existing rows keep a token.
+            assert reopened.list_work()[0]["fencing_token"] == 1
+            reopened.rebuild_projections()
+            assert reopened.list_work()[0]["fencing_token"] == 1
+            assert reopened.verify()["ok"] is True
+        finally:
+            reopened.close()
+
+        # Reopening again must not re-apply the migration or disturb the ledger.
+        again = LedgerStore(ledger_path, synchronous="NORMAL")
+        try:
+            assert again.list_work()[0]["fencing_token"] == 1
+            assert again.count() == 1
+        finally:
+            again.close()
+
+    @pytest.mark.skipif(
+        sqlite3.sqlite_version_info < (3, 35, 0),
+        reason="simulating a pre-fencing ledger needs ALTER TABLE ... DROP COLUMN",
+    )
+    def test_concurrent_first_open_migrates_the_fencing_column_once(self, ledger_path: Path):
+        initial = LedgerStore(ledger_path, synchronous="NORMAL")
+        initial.close()
+        connection = sqlite3.connect(str(ledger_path))
+        connection.execute("DROP TABLE work_fences")
+        connection.execute("ALTER TABLE works DROP COLUMN fencing_token")
+        connection.commit()
+        connection.close()
+
+        barrier = threading.Barrier(2)
+        opened: list[LedgerStore] = []
+        errors: list[Exception] = []
+
+        def open_legacy() -> None:
+            barrier.wait()
+            try:
+                opened.append(LedgerStore(ledger_path, synchronous="NORMAL"))
+            except Exception as exc:  # pragma: no cover - assertion reports details
+                errors.append(exc)
+
+        threads = [threading.Thread(target=open_legacy) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10.0)
+        try:
+            assert errors == []
+            assert len(opened) == 2
+            assert "fencing_token" in _columns(ledger_path, "works")
+        finally:
+            for item in opened:
+                item.close()

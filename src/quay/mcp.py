@@ -67,10 +67,11 @@ TOOLS: tuple[dict[str, Any], ...] = (
                 "payload": {"type": "object", "description": "typed event payload"},
                 "kind": {
                     "type": "string",
-                    "description": "signal, work, note, metric, or generic (default: generic)",
+                    "description": "signal, work, handoff, note, metric, or generic (default: generic)",
                 },
                 "producer": {"type": "string", "description": "producer identity (default: quay)"},
                 "causation_id": {"type": "integer", "minimum": 1},
+                "root_causation_id": {"type": "integer", "minimum": 1},
                 "correlation_id": {"type": "string"},
             },
             "required": ["topic", "payload"],
@@ -112,6 +113,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
                 "title": {"type": "string"},
                 "lease_seconds": {"type": "integer", "minimum": 1},
                 "causation_id": {"type": "integer", "minimum": 1},
+                "root_causation_id": {"type": "integer", "minimum": 1},
                 "correlation_id": {"type": "string"},
             },
             "required": ["key", "executor"],
@@ -129,9 +131,11 @@ TOOLS: tuple[dict[str, Any], ...] = (
                 "evidence": {"type": "object", "minProperties": 1},
                 "topic": {"type": "string", "description": "default: work/queue"},
                 "causation_id": {"type": "integer", "minimum": 1},
+                "root_causation_id": {"type": "integer", "minimum": 1},
+                "fencing_token": {"type": "integer", "minimum": 1},
                 "correlation_id": {"type": "string"},
             },
-            "required": ["key", "executor", "evidence"],
+            "required": ["key", "executor", "evidence", "fencing_token"],
             "additionalProperties": False,
         },
     },
@@ -360,6 +364,7 @@ def _tool_quay_emit(bridge: Bridge, arguments: Mapping[str, Any]) -> dict[str, A
         "payload": arguments.get("payload", {}),
         "kind": arguments.get("kind", "generic"),
         "causation_id": arguments.get("causation_id"),
+        "root_causation_id": arguments.get("root_causation_id"),
         "correlation_id": arguments.get("correlation_id"),
     }
     return {"event": bridge.request("emit", body)["event"]}
@@ -376,7 +381,9 @@ def _tool_quay_status(bridge: Bridge, arguments: Mapping[str, Any]) -> dict[str,
 
 def _tool_quay_work_claim(bridge: Bridge, arguments: Mapping[str, Any]) -> dict[str, Any]:
     body: dict[str, Any] = {"key": arguments["key"], "executor": arguments["executor"]}
-    for optional in ("topic", "title", "lease_seconds", "causation_id", "correlation_id"):
+    for optional in (
+        "topic", "title", "lease_seconds", "causation_id", "root_causation_id", "correlation_id"
+    ):
         if arguments.get(optional) is not None:
             body[optional] = arguments[optional]
     return {"event": bridge.request("work_claim", body)["event"]}
@@ -387,8 +394,9 @@ def _tool_quay_work_complete(bridge: Bridge, arguments: Mapping[str, Any]) -> di
         "key": arguments["key"],
         "executor": arguments["executor"],
         "evidence": arguments["evidence"],
+        "fencing_token": arguments["fencing_token"],
     }
-    for optional in ("topic", "causation_id", "correlation_id"):
+    for optional in ("topic", "causation_id", "root_causation_id", "correlation_id"):
         if arguments.get(optional) is not None:
             body[optional] = arguments[optional]
     return {"event": bridge.request("work_complete", body)["event"]}

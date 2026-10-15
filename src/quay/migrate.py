@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from .schemas import PRODUCER_PATTERN
-from .store import LedgerStore, StoreError
+from .store import FENCING_TOKEN_FIELD, LedgerStore, StoreError
 
 BATCH_SIZE = 500
 
@@ -244,6 +244,24 @@ def _synthetic_root(event: Mapping[str, Any], changi_id: int) -> dict[str, Any]:
     }
 
 
+def _with_parent_fencing_token(
+    event: Mapping[str, Any], parent: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Copy the token assigned to a reconstructed/imported claim onto its child."""
+    if event.get("kind") != "work" or parent.get("kind") != "work":
+        return dict(event)
+    parent_payload = parent.get("payload")
+    if not isinstance(parent_payload, Mapping):
+        return dict(event)
+    token = parent_payload.get(FENCING_TOKEN_FIELD)
+    if isinstance(token, bool) or not isinstance(token, int) or token <= 0:
+        return dict(event)
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping):
+        return dict(event)
+    return {**event, "payload": {**payload, FENCING_TOKEN_FIELD: token}}
+
+
 def _append_with_fallback(
     store: LedgerStore,
     event: dict[str, Any],
@@ -300,7 +318,10 @@ def _append_with_fallback(
             f"event {changi_id}: reconstructed a {ROOT_STATES[str(event['kind'])]} root "
             f"to satisfy the state machine ({exc.code})"
         )
-        linked = {**event, "causation_id": root["seq"]}
+        linked = {
+            **_with_parent_fencing_token(event, root),
+            "causation_id": root["seq"],
+        }
         try:
             return store.append(**linked)
         except StoreError as final:
@@ -319,6 +340,7 @@ def migrate_changi(
     started = time.perf_counter()
     report = MigrationReport(source=str(database), dry_run=dry_run)
     seq_for_changi_id: dict[int, int] = {}
+    written_for_changi_id: dict[int, dict[str, Any]] = {}
     pending: list[tuple[dict[str, Any], int]] = []
     # Sequence numbers are assigned consecutively by append_batch, so the next
     # seq can be predicted. That lets an event reference a parent that is still
@@ -327,6 +349,7 @@ def migrate_changi(
 
     def record(written: Mapping[str, Any], changi_id: int) -> None:
         seq_for_changi_id[changi_id] = int(written["seq"])
+        written_for_changi_id[changi_id] = dict(written)
         report.migrated += 1
         kind = str(written["kind"])
         report.kinds[kind] = report.kinds.get(kind, 0) + 1
@@ -335,7 +358,7 @@ def migrate_changi(
         return {key: value for key, value in event.items() if key != "_parent_changi"}
 
     def flush() -> None:
-        nonlocal pending
+        nonlocal next_seq, pending
         if not pending or dry_run:
             pending = []
             return
@@ -345,15 +368,27 @@ def migrate_changi(
         except StoreError as exc:
             # A single bad row must not sink the batch: retry row by row.
             report.warnings.append(f"batch retried row-by-row after: {exc.code}")
+            # All entries in this batch currently have speculative mappings.
+            # Remove them before retrying so a skipped parent cannot silently
+            # redirect a child to whichever event takes its predicted seq.
+            for _, changi_id in batch:
+                seq_for_changi_id.pop(changi_id, None)
             for event, changi_id in batch:
                 candidate = plain(event)
                 parent = event.get("_parent_changi")
-                if parent is not None and parent not in seq_for_changi_id:
-                    # The parent was skipped, so this predicted link is stale.
-                    candidate.pop("causation_id", None)
+                if parent is not None:
+                    actual_parent = seq_for_changi_id.get(int(parent))
+                    if actual_parent is None:
+                        # The parent was skipped, so this predicted link is stale.
+                        candidate.pop("causation_id", None)
+                    else:
+                        # An earlier retry may have landed at a different seq
+                        # after another row was skipped.
+                        candidate["causation_id"] = actual_parent
                 written_event = _append_with_fallback(store, candidate, changi_id, report)
                 if written_event is not None:
                     record(written_event, changi_id)
+            next_seq = store.last_seq() + 1
         else:
             for event, changi_id in zip(written, [item[1] for item in batch]):
                 record(event, changi_id)
@@ -365,6 +400,19 @@ def migrate_changi(
         causation = translated.pop("changi_causation_id")
         changi_id = int(translated["changi_event_id"])
         mapped = seq_for_changi_id.get(causation) if isinstance(causation, int) else None
+        if (
+            mapped is not None
+            and translated["kind"] == "work"
+            and translated["payload"].get("state") in ("done", "failed")
+        ):
+            # The parent may still be in the pending batch.  Flush it so the
+            # store-assigned claim token is known before fencing the terminal
+            # legacy receipt.  Generic imports retain the 500-row fast path.
+            flush()
+            mapped = seq_for_changi_id.get(causation)
+            parent = written_for_changi_id.get(int(causation))
+            if parent is not None:
+                translated = _with_parent_fencing_token(translated, parent)
         if causation is not None and mapped is None:
             report.warnings.append(
                 f"event {changi_id}: causation {causation} was not migrated; the link was dropped"
@@ -396,6 +444,7 @@ def migrate_changi(
                     )
                 else:
                     report.synthesized += 1
+                    event = _with_parent_fencing_token(event, root)
                     event["causation_id"] = root["seq"]
                     next_seq = root["seq"] + 1
                     report.warnings.append(

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import signal
 import subprocess
@@ -219,6 +220,10 @@ def idle_from_env(default: float = IDLE_SECONDS_DEFAULT) -> float:
 
 def daemon_main(argv: list[str] | None = None) -> int:
     """Entry point for ``python -m quay.daemon`` / the ``quayd`` script."""
+    # Establish the process-wide creation mask before SQLite can create the
+    # database, WAL, or shared-memory sidecars. Explicit chmod remains defense
+    # in depth for already-existing paths.
+    os.umask(0o077)
     parser = argparse.ArgumentParser(prog="quayd", description="Quay workspace daemon")
     parser.add_argument("--workspace", default=os.getcwd(), help="workspace root")
     parser.add_argument("--socket", default=None, help="override the control socket path")
@@ -229,8 +234,8 @@ def daemon_main(argv: list[str] | None = None) -> int:
         help="shut down after this many idle seconds (0 disables idle shutdown)",
     )
     parser.add_argument("--heartbeat-seconds", type=float, default=10.0)
-    parser.add_argument("--subscriber-queue", type=int, default=256)
-    parser.add_argument("--synchronous", default=os.environ.get("QUAY_SQLITE_SYNCHRONOUS", "FULL"))
+    parser.add_argument("--subscriber-queue", type=int, default=4096)
+    parser.add_argument("--synchronous", default=os.environ.get("QUAY_SQLITE_SYNCHRONOUS", "NORMAL"))
     parser.add_argument("--version", action="version", version=f"quayd (quay {__version__})")
     args = parser.parse_args(argv)
 

@@ -28,7 +28,7 @@ from .canonical import CanonicalError, canonical_json
 
 SCHEMA_VERSION = "1"
 
-KINDS = ("signal", "work", "note", "metric", "generic")
+KINDS = ("signal", "work", "handoff", "note", "metric", "generic")
 
 SIGNAL_STATES = ("pending", "claimed", "cleared", "expired")
 SIGNAL_TERMINAL_STATES = ("cleared", "expired")
@@ -45,6 +45,7 @@ _MISSING = object()
 TOPIC_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 PRODUCER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,99}$")
 CORRELATION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+HANDOFF_TOPIC_PATTERN = re.compile(r"^swarm/([A-Za-z0-9][A-Za-z0-9._:-]{0,99})/handoff$")
 
 MAX_TOPIC_LENGTH = 200
 MAX_CANONICAL_PAYLOAD_BYTES = 256 * 1024
@@ -155,6 +156,7 @@ def _validate_work(payload: dict[str, Any]) -> dict[str, Any]:
         "lease_seconds",
         "evidence",
         "reason",
+        "fencing_token",
     )
     _reject_unknown_fields(payload, allowed, "work")
     normalized: dict[str, Any] = {
@@ -182,6 +184,15 @@ def _validate_work(payload: dict[str, Any]) -> dict[str, Any]:
         normalized["evidence"] = evidence
     if "reason" in payload:
         normalized["reason"] = _require_str(payload, "reason", "work")
+    if "fencing_token" in payload:
+        token = payload["fencing_token"]
+        if isinstance(token, bool) or not isinstance(token, int) or token <= 0:
+            raise ValidationError(
+                "invalid_fencing_token",
+                "work payload 'fencing_token' must be a positive integer",
+                {"value": token},
+            )
+        normalized["fencing_token"] = token
     if normalized["state"] in ("done", "failed"):
         if "evidence" not in normalized:
             raise ValidationError(
@@ -195,6 +206,44 @@ def _validate_work(payload: dict[str, Any]) -> dict[str, Any]:
             f"work payload in state '{normalized['state']}' requires 'reason' or 'evidence'",
             {"state": normalized["state"]},
         )
+    return normalized
+
+
+def _validate_handoff(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate the bounded swarm routing payload.
+
+    Topic/producer consistency is checked in :func:`prepare_event`, where the
+    envelope fields are available.  Keeping the payload validator context-free
+    preserves the public ``validate_payload`` API.
+    """
+    allowed = ("from", "to", "summary", "initiative", "links", "action")
+    _reject_unknown_fields(payload, allowed, "handoff")
+    normalized: dict[str, Any] = {
+        "from": _require_str(payload, "from", "handoff", max_length=100),
+        "to": _require_str(payload, "to", "handoff", max_length=100),
+        "summary": _require_str(payload, "summary", "handoff", max_length=2000),
+    }
+    if "initiative" in payload:
+        normalized["initiative"] = _require_str(
+            payload, "initiative", "handoff", max_length=200
+        )
+    if "links" in payload:
+        links = payload["links"]
+        if (
+            not isinstance(links, list)
+            or len(links) > 10
+            or not all(isinstance(link, str) and link.strip() for link in links)
+        ):
+            raise ValidationError(
+                "invalid_links",
+                "handoff payload 'links' must be a list of at most 10 non-empty strings",
+            )
+        normalized["links"] = [link.replace("\\", "/") for link in links]
+    if "action" in payload:
+        action = payload["action"]
+        if not isinstance(action, dict):
+            raise ValidationError("invalid_action", "handoff payload 'action' must be an object")
+        normalized["action"] = dict(action)
     return normalized
 
 
@@ -228,6 +277,7 @@ def _validate_generic(payload: dict[str, Any]) -> dict[str, Any]:
 _VALIDATORS = {
     "signal": _validate_signal,
     "work": _validate_work,
+    "handoff": _validate_handoff,
     "note": _validate_note,
     "metric": _validate_metric,
     "generic": _validate_generic,
@@ -267,6 +317,7 @@ def prepare_event(
     payload: Any,
     kind: Any = "generic",
     causation_id: Any = None,
+    root_causation_id: Any = None,
     correlation_id: Any = None,
 ) -> tuple[dict[str, Any], str]:
     """Validate caller input and return ``(event_fields, canonical_payload_text)``.
@@ -293,6 +344,17 @@ def prepare_event(
             raise ValidationError(
                 "invalid_causation", "causation_id must be a positive integer", {"causation_id": causation_id}
             )
+    if root_causation_id is not None:
+        if (
+            isinstance(root_causation_id, bool)
+            or not isinstance(root_causation_id, int)
+            or root_causation_id <= 0
+        ):
+            raise ValidationError(
+                "invalid_root_causation",
+                "root_causation_id must be a positive integer",
+                {"root_causation_id": root_causation_id},
+            )
     if correlation_id is not None:
         if not isinstance(correlation_id, str) or not CORRELATION_PATTERN.match(correlation_id):
             raise ValidationError(
@@ -304,6 +366,28 @@ def prepare_event(
     resolved_kind = normalize_kind(kind)
     raw_payload = payload if payload is not None else {}
     normalized_payload = validate_payload(resolved_kind, raw_payload)
+
+    if resolved_kind == "handoff":
+        match = HANDOFF_TOPIC_PATTERN.fullmatch(topic)
+        if match is None:
+            raise ValidationError(
+                "invalid_handoff_topic",
+                "handoff topic must be 'swarm/<recipient>/handoff'",
+                {"topic": topic},
+            )
+        recipient = match.group(1)
+        if normalized_payload["from"] != producer:
+            raise ValidationError(
+                "handoff_sender_mismatch",
+                "handoff payload 'from' must equal the envelope producer",
+                {"from": normalized_payload["from"], "producer": producer},
+            )
+        if normalized_payload["to"] != recipient:
+            raise ValidationError(
+                "handoff_recipient_mismatch",
+                "handoff payload 'to' must equal the topic recipient",
+                {"to": normalized_payload["to"], "recipient": recipient},
+            )
 
     label = kind if isinstance(kind, str) else "generic"
     if resolved_kind == "generic" and label.strip().lower() not in KINDS:
@@ -330,6 +414,7 @@ def prepare_event(
             "producer": producer,
             "payload": normalized_payload,
             "causation_id": causation_id,
+            "root_causation_id": root_causation_id,
             "correlation_id": correlation_id,
         },
         encoded_text,
@@ -343,6 +428,7 @@ def normalize_event(
     payload: Any,
     kind: Any = "generic",
     causation_id: Any = None,
+    root_causation_id: Any = None,
     correlation_id: Any = None,
 ) -> dict[str, Any]:
     """Validate caller input and return the canonical pre-insert event fields.
@@ -356,6 +442,7 @@ def normalize_event(
         payload=payload,
         kind=kind,
         causation_id=causation_id,
+        root_causation_id=root_causation_id,
         correlation_id=correlation_id,
     )[0]
 
@@ -365,6 +452,10 @@ def describe_kind(kind: str) -> dict[str, Any]:
     descriptions: dict[str, dict[str, Any]] = {
         "signal": {"states": list(SIGNAL_STATES), "required": ["state"], "purpose": "request for attention"},
         "work": {"states": list(WORK_STATES), "required": ["key", "executor", "state"], "purpose": "unit of work"},
+        "handoff": {
+            "required": ["from", "to", "summary"],
+            "purpose": "bounded swarm coordination handoff",
+        },
         "note": {"required": ["text"], "purpose": "free-text annotation"},
         "metric": {"required": ["name", "value"], "purpose": "named numeric sample"},
         "generic": {"required": [], "purpose": "any JSON object"},

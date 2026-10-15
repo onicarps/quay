@@ -53,6 +53,12 @@ class TestStartAndReuse:
         with QuayClient(paths.socket) as client:
             assert client.emit(topic="daemon", producer="p", payload={"hello": True})["seq"] == 1
 
+        assert paths.database.stat().st_mode & 0o777 == 0o600
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(paths.database) + suffix)
+            assert sidecar.exists(), f"SQLite sidecar was not created: {sidecar}"
+            assert sidecar.stat().st_mode & 0o777 == 0o600
+
     def test_second_call_reuses_the_same_daemon(self, workspace: Path, daemon):
         _, first = daemon
         _, second = ensure_daemon(workspace, idle_seconds=0)

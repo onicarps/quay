@@ -32,7 +32,10 @@ import termios
 import time
 import tty
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
+
+if TYPE_CHECKING:
+    from .client import SubscriptionStream
 
 #: 256-colour styles keep the TUI readable on every modern terminal.
 STYLES: dict[str, str] = {
@@ -48,6 +51,7 @@ STYLES: dict[str, str] = {
     "selected": "\x1b[7;38;5;231m",
     "signal": "\x1b[38;5;203m",
     "work": "\x1b[38;5;39m",
+    "handoff": "\x1b[38;5;45m",
     "note": "\x1b[38;5;150m",
     "metric": "\x1b[38;5;183m",
     "generic": "\x1b[38;5;245m",
@@ -64,6 +68,7 @@ REFRESH_KEY = "\x0c"
 KIND_STYLE = {
     "signal": "signal",
     "work": "work",
+    "handoff": "handoff",
     "note": "note",
     "metric": "metric",
     "generic": "generic",
@@ -74,6 +79,7 @@ FILTER_PRESETS: tuple[tuple[str, str | None], ...] = (
     ("all", None),
     ("signal", "signal"),
     ("work", "work"),
+    ("handoff", "handoff"),
     ("note", "note"),
     ("metric", "metric"),
 )
@@ -245,7 +251,7 @@ HELP_LINES = (
     "  g / G        jump to oldest / newest",
     "  space        pause or resume live updates",
     "  f            cycle the kind filter",
-    "  1 - 5        jump to a specific kind filter",
+    "  1 - 6        jump to a specific kind filter",
     "  d            toggle the detail pane",
     "  s            inject a sample agent event",
     "  v            verify the ledger hash chain",
@@ -265,7 +271,7 @@ SAMPLE_PRODUCER = "quay"
 
 #: Kept under 100 columns so the tail stays visible on a narrow terminal; the
 #: help overlay lists the full set of keys, including the detail toggle.
-HINT_LINE = " q detach  ↑↓ move  space pause  f filter  1-5  s sample  v verify  b reap  ctrl-l refresh  ? help"
+HINT_LINE = " q detach  ↑↓ move  space pause  f filter  1-6  s sample  v verify  b reap  ctrl-l refresh  ? help"
 
 
 class Dashboard:
@@ -556,7 +562,7 @@ class TuiApp:
         elif key == "f":
             self.filter_index = (self.filter_index + 1) % len(FILTER_PRESETS)
             self.reload_history(client)
-        elif key in "12345":
+        elif len(key) == 1 and key in "123456":
             self.filter_index = int(key) - 1
             self.reload_history(client)
         elif key == "d":
@@ -656,6 +662,7 @@ class TuiApp:
         previous: list[list[tuple[str, str]]] | None = None
         last_status = 0.0
         iterations = 0
+        stream_ended = False
         with factory(on_resize=self.request_redraw) as reader:
             write = stream.write
             write(f"\x1b[?1049h{CLEAR_SCREEN}\x1b[?25l")
@@ -682,7 +689,7 @@ class TuiApp:
                         with contextlib.suppress(Exception):
                             self.health = client.health()
                         last_status = now
-                    frame = live.poll(0.0)
+                    frame = None if stream_ended else live.poll(0.0)
                     while frame is not None:
                         if frame.get("type") == "event":
                             self.ingest(frame["event"])
@@ -691,6 +698,16 @@ class TuiApp:
                             self.message = f"daemon dropped {self.dropped} push(es); re-read history"
                         elif frame.get("type") == "shutdown":
                             self.message = "daemon is shutting down"
+                            stream_ended = True
+                            frame = None
+                            break
+                        elif frame.get("type") == "recovery_error":
+                            error = frame.get("error") or {}
+                            self.message = (
+                                "stream ended: "
+                                f"{error.get('code', 'recovery_failed')}"
+                            )
+                            stream_ended = True
                             frame = None
                             break
                         frame = live.poll(0.0)

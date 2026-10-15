@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import functools
 import json
 import os
 import stat
@@ -53,6 +54,7 @@ __all__ = [
     "WorkspaceError",
     "LedgerPaths",
     "canonical_workspace",
+    "git_common_root",
     "paths_for",
     "utc_now",
     "assert_owned_file",
@@ -87,6 +89,20 @@ class WorkspaceError(RuntimeError):
         return {"code": self.code, "message": self.message, "detail": {}}
 
 
+class _UseWorkspaceRoot(Exception):
+    """Internal signal for a confirmed non-Git directory or missing Git."""
+
+
+def _not_a_git_repository(result: subprocess.CompletedProcess[str]) -> bool:
+    stderr = result.stderr.lower()
+    return (
+        "not a git repository" in stderr
+        or "not a git work tree" in stderr
+        or "must be run in a work tree" in stderr
+        or "dubious ownership" in stderr
+    )
+
+
 @dataclass(frozen=True)
 class LedgerPaths:
     """Absolute paths for one workspace's runtime state."""
@@ -116,9 +132,151 @@ def canonical_workspace(value: str | os.PathLike[str]) -> Path:
     return root
 
 
+@functools.lru_cache(maxsize=256)
+def _git_common_root_cached(device: int, inode: int, root_text: str) -> str:
+    """Resolve a repository's shared root once per stable directory inode.
+
+    ``device`` and ``inode`` deliberately participate in the cache key so a
+    path replaced in place cannot inherit the previous checkout's resolution.
+    ``root_text`` is retained only so this pure cached function can invoke Git.
+    """
+    del device, inode
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                root_text,
+                "rev-parse",
+                "--git-common-dir",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise _UseWorkspaceRoot from exc
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise WorkspaceError(
+            "git_unavailable", f"Git common-root resolution failed for {root_text}: {exc}"
+        ) from exc
+    common = result.stdout.strip()
+    if result.returncode != 0:
+        if _not_a_git_repository(result):
+            raise _UseWorkspaceRoot
+        raise WorkspaceError(
+            "git_unavailable",
+            f"Git common-root resolution failed for {root_text}: {result.stderr.strip()}",
+        )
+    if not common:
+        raise WorkspaceError(
+            "git_unavailable", f"Git returned an empty common root for {root_text}"
+        )
+    common_dir = Path(common)
+    if not common_dir.is_absolute():
+        common_dir = Path(root_text) / common_dir
+    try:
+        resolved = common_dir.resolve(strict=True)
+    except OSError as exc:
+        raise WorkspaceError(
+            "git_unavailable", f"Git common root is unavailable for {root_text}: {common}"
+        ) from exc
+    try:
+        bare = subprocess.run(
+            ["git", "-C", root_text, "rev-parse", "--is-bare-repository"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        raise WorkspaceError(
+            "git_unavailable", f"Git repository-mode detection failed for {root_text}: {exc}"
+        ) from exc
+    if bare.returncode != 0:
+        raise WorkspaceError(
+            "git_unavailable",
+            f"Git repository-mode detection failed for {root_text}: {bare.stderr.strip()}",
+        )
+    if bare.stdout.strip() == "true":
+        return str(resolved)
+
+    def show_toplevel(at: str | Path) -> Path | None:
+        try:
+            top = subprocess.run(
+                ["git", "-C", str(at), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            raise WorkspaceError(
+                "git_unavailable", f"Git worktree resolution failed for {at}: {exc}"
+            ) from exc
+        if top.returncode != 0:
+            if _not_a_git_repository(top):
+                return None
+            raise WorkspaceError(
+                "git_unavailable",
+                f"Git worktree resolution failed for {at}: {top.stderr.strip()}",
+            )
+        if not top.stdout.strip():
+            raise WorkspaceError(
+                "git_unavailable", f"Git returned an empty worktree root for {at}"
+            )
+        try:
+            candidate = Path(top.stdout.strip()).resolve(strict=True)
+        except OSError as exc:
+            raise WorkspaceError(
+                "git_unavailable", f"Git worktree root is unavailable for {at}"
+            ) from exc
+        return candidate if candidate.is_dir() else None
+
+    # A normal repository (including linked worktrees) has a shared
+    # ``<primary>/.git`` directory, so its parent is the desired common root.
+    # Submodules point into ``.git/modules/<name>`` and separate-git-dir
+    # checkouts may point anywhere; neither parent is a working tree.
+    candidate = resolved.parent
+    candidate_top = show_toplevel(candidate)
+    inside_git_admin = ".git" in resolved.parts[:-1]
+    if (
+        resolved.name == ".git"
+        and not inside_git_admin
+        and candidate_top == candidate
+    ):
+        return str(candidate)
+
+    worktree = show_toplevel(root_text)
+    if worktree is None:
+        raise WorkspaceError(
+            "git_unavailable", f"Git common root has no corresponding worktree: {root_text}"
+        )
+    return str(worktree)
+
+
+def git_common_root(workspace: str | os.PathLike[str]) -> Path:
+    """Return the primary repository root shared by all linked worktrees.
+
+    Non-Git directories retain their canonical workspace.  Git resolution is
+    memoized by the directory's filesystem identity to avoid repeated
+    subprocess launches on hot path discovery.
+    """
+    root = canonical_workspace(workspace)
+    info = root.stat()
+    try:
+        resolved = _git_common_root_cached(info.st_dev, info.st_ino, str(root))
+    except _UseWorkspaceRoot:
+        # Exceptions are not retained by lru_cache, so a later ``git init`` or
+        # restored Git executable causes a fresh topology lookup.
+        return root
+    return Path(resolved)
+
+
 def paths_for(workspace: str | os.PathLike[str], *, create: bool = True) -> LedgerPaths:
     """Return the runtime paths for ``workspace``, creating ``.quay`` if asked."""
-    root = canonical_workspace(workspace)
+    root = git_common_root(workspace)
     if root.parent == root:
         raise WorkspaceError(
             "unsafe_workspace",
@@ -423,7 +581,7 @@ def ensure_git_ignore(workspace: Path) -> str | None:
     ``.gitignore`` is a symlink (never write through a link). The append is
     idempotent and preserves the existing contents and newline handling.
     """
-    top = git_worktree_root(workspace)
+    top = git_common_root(workspace) if git_worktree_root(workspace) is not None else None
     if top is None:
         return None
     target = top / ".gitignore"

@@ -177,15 +177,21 @@ class TestEmitAndQuery:
 
     def test_kinds_lists_the_registry(self, run, ws):
         payload = as_json(run("kinds")[1])
-        assert {item["kind"] for item in payload["kinds"]} == {"signal", "work", "note", "metric", "generic"}
+        assert {item["kind"] for item in payload["kinds"]} == {
+            "signal", "work", "handoff", "note", "metric", "generic"
+        }
 
 
 class TestWorkPlane:
     def test_full_work_lifecycle(self, run, ws):
         claim = as_json(run("work", "claim", "job-1", "--executor", "factory", "--lease-seconds", "600")[1])["event"]
         assert claim["payload"]["state"] == "claimed"
+        token = str(claim["payload"]["fencing_token"])
         beat = as_json(
-            run("work", "heartbeat", "job-1", "--executor", "factory", "--causation", str(claim["seq"]))[1]
+            run(
+                "work", "heartbeat", "job-1", "--executor", "factory",
+                "--causation", str(claim["seq"]), "--fencing-token", token,
+            )[1]
         )["event"]
         assert beat["payload"]["state"] == "in_flight"
         done = as_json(
@@ -197,6 +203,8 @@ class TestWorkPlane:
                 "factory",
                 "--causation",
                 str(beat["seq"]),
+                "--fencing-token",
+                token,
                 "--evidence",
                 '{"commit": "abc123"}',
             )[1]
@@ -333,6 +341,83 @@ class TestWatch:
         lines = [json.loads(line) for line in out.splitlines() if line.strip()]
         assert [event["seq"] for event in lines] == [1, 2]
 
+    def test_follow_surfaces_a_terminal_recovery_error(self, monkeypatch):
+        real_stream = cli.SubscriptionStream
+
+        class FakeConnection:
+            socket_path = Path("/tmp/unused.sock")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+        class RecoveryFailedStream:
+            is_terminal = True
+            _raise_recovery_error = staticmethod(real_stream._raise_recovery_error)
+
+            def __init__(self, *args, **kwargs):
+                self.frames = [
+                    {
+                        "type": "recovery_error",
+                        "error": {
+                            "code": "recovery_queue_full",
+                            "message": "backfill queue filled",
+                            "detail": {"until_seq": 99},
+                        },
+                    }
+                ]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+            def poll(self, timeout):
+                return self.frames.pop(0) if self.frames else None
+
+        monkeypatch.setattr(cli, "connected", lambda args: FakeConnection())
+        monkeypatch.setattr(cli, "SubscriptionStream", RecoveryFailedStream)
+        args = argparse.Namespace(duration=None, max_events=None)
+
+        with pytest.raises(cli.ClientError) as excinfo:
+            cli._follow(args, json_mode=True, initial_limit=0)  # noqa: SLF001
+        assert excinfo.value.code == "recovery_queue_full"
+        assert excinfo.value.detail == {"until_seq": 99}
+
+    def test_follow_exits_after_a_clean_terminal_stream(self, monkeypatch):
+        class FakeConnection:
+            socket_path = Path("/tmp/unused.sock")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+        class EndedStream:
+            is_terminal = True
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+            def poll(self, timeout):
+                return None
+
+        monkeypatch.setattr(cli, "connected", lambda args: FakeConnection())
+        monkeypatch.setattr(cli, "SubscriptionStream", EndedStream)
+        args = argparse.Namespace(duration=None, max_events=None)
+
+        assert cli._follow(args, json_mode=True, initial_limit=0) == 0  # noqa: SLF001
+
     def test_watch_plain_honours_the_duration_bound(self, run, ws):
         code, _out, _err = run("watch", "--plain", "--history", "0", "--for", "0.3")
         assert code == 0
@@ -365,10 +450,12 @@ class TestWatch:
         assert [event["seq"] for event in lines] == [1, 2, 3]
 
     def test_monitor_auto_initializes_a_fresh_workspace(self, run, ws):
-        code, out, err = run("monitor")
+        code, out, err = run("monitor", "--history", "1", "--max-events", "1")
         assert code == 0
-        assert as_json(out)["ledger"]["records"] == 1
-        assert "no TTY" in err
+        events = [json.loads(line) for line in out.splitlines() if line.strip()]
+        assert len(events) == 1
+        assert events[0]["topic"] == "quay/init"
+        assert "streaming JSON lines" in err
 
 
 class TestPositionalWorkspace:

@@ -170,6 +170,27 @@ class TestErrorBoundaries:
 
 
 class TestStreaming:
+    def test_maintenance_reaper_waits_for_the_subscription_write_lock(
+        self, server: QuayServer, monkeypatch: pytest.MonkeyPatch
+    ):
+        called = threading.Event()
+
+        def reap():
+            called.set()
+            return []
+
+        server._write_lock.acquire()  # noqa: SLF001 - deterministic boundary seam
+        monkeypatch.setattr(server.store, "reap_expired_leases", reap)
+        thread = threading.Thread(target=server._reap_expired)  # noqa: SLF001
+        try:
+            thread.start()
+            assert called.wait(0.1) is False
+        finally:
+            server._write_lock.release()  # noqa: SLF001
+        thread.join(timeout=2.0)
+
+        assert called.is_set()
+
     def test_subscriber_receives_pushed_events_without_polling(self, client: QuayClient, stream):
         live = stream()
         emitted = client.emit(topic="okf/handoff", producer="factory", payload={"summary": "hi"})
@@ -205,17 +226,24 @@ class TestStreaming:
     def test_state_and_producer_filters(self, client: QuayClient, stream):
         live = stream({"kind": "work", "state": "done", "producer": "codex"})
         first = client.emit(topic="w", producer="codex", payload={"key": "a", "executor": "codex", "state": "claimed"}, kind="work")
+        token = first["payload"]["fencing_token"]
         second = client.emit(
             topic="w",
             producer="codex",
-            payload={"key": "a", "executor": "codex", "state": "in_flight"},
+            payload={
+                "key": "a", "executor": "codex", "state": "in_flight",
+                "fencing_token": token,
+            },
             kind="work",
             causation_id=first["seq"],
         )
         third = client.emit(
             topic="w",
             producer="codex",
-            payload={"key": "a", "executor": "codex", "state": "done", "evidence": {"commit": "c"}},
+            payload={
+                "key": "a", "executor": "codex", "state": "done",
+                "evidence": {"commit": "c"}, "fencing_token": token,
+            },
             kind="work",
             causation_id=second["seq"],
         )
@@ -233,6 +261,79 @@ class TestStreaming:
         # Live delivery still works after the replay backlog.
         client.emit(topic="hist", producer="p", payload={"i": 99})
         assert live.wait_for(1, timeout=5.0)[0]["payload"]["i"] == 99
+
+    def test_replay_zero_starts_recovery_at_the_subscription_boundary(
+        self, server: QuayServer
+    ):
+        with QuayClient(server.socket_path) as writer:
+            for index in range(3):
+                writer.emit(topic="boundary", producer="p", payload={"i": index})
+            live = SubscriptionStream(
+                server.socket_path,
+                filters={"topic": "boundary"},
+                replay=0,
+                timeout=5.0,
+            ).open()
+            try:
+                assert live._last_received_seq == 3  # noqa: SLF001
+                written = writer.emit(topic="boundary", producer="p", payload={"i": 3})
+                assert live.wait_for(timeout=5.0) == [written]
+            finally:
+                live.close()
+
+    def test_subscription_stream_backfills_a_reported_gap(self, server: QuayServer):
+        with QuayClient(server.socket_path) as writer:
+            for index in range(10):
+                writer.emit(topic="recover", producer="p", payload={"i": index})
+        recovering = SubscriptionStream(
+            server.socket_path,
+            filters={"topic": "recover"},
+            queue_size=32,
+            timeout=5.0,
+        )
+        recovering._last_received_seq = 2  # noqa: SLF001 - deterministic gap seam
+        recovering._recover_gap(8)  # noqa: SLF001 - exercise the recovery loop directly
+        events = recovering.wait_for(6, timeout=1.0)
+        assert [event["seq"] for event in events] == [3, 4, 5, 6, 7, 8]
+        assert recovering.recovered_events == 6
+
+    def test_recovery_failure_survives_a_full_consumer_queue(self, tmp_path: Path):
+        live = SubscriptionStream(tmp_path / "unused.sock", queue_size=1)
+        reader, daemon = socket.socketpair()
+        live._sock = reader  # noqa: SLF001 - deterministic reader-loop seam
+        assert live._put_event_frame(  # noqa: SLF001
+            {"type": "event", "event": {"seq": 1, "kind": "note", "payload": {}}}
+        )
+
+        def fail_recovery(until_seq: int) -> None:
+            raise ClientError(
+                "recovery_queue_full",
+                "test recovery failure",
+                {"until_seq": until_seq},
+            )
+
+        live._recover_gap = fail_recovery  # type: ignore[method-assign]  # noqa: SLF001
+        thread = threading.Thread(target=live._read_loop)  # noqa: SLF001
+        thread.start()
+        try:
+            send_frame(
+                daemon,
+                {"v": "1", "type": "lagged", "sub": 1, "dropped": 1, "last_seq": 2},
+            )
+            thread.join(timeout=5.0)
+            assert not thread.is_alive()
+
+            events = live.events(timeout=None)
+            assert next(events)["seq"] == 1
+            with pytest.raises(ClientError) as excinfo:
+                next(events)
+            assert excinfo.value.code == "recovery_queue_full"
+
+            daemon.settimeout(1.0)
+            assert daemon.recv(1) == b"", "terminal recovery must close the subscription socket"
+        finally:
+            live.close()
+            daemon.close()
 
     def test_unsubscribe_stops_delivery(self, client: QuayClient, stream):
         live = stream()
@@ -352,6 +453,15 @@ class TestBackpressure:
 
 
 class TestClientAndServerLifecycle:
+    def test_bus_defaults_use_large_outbox_and_normal_sync(self, workspace: Path):
+        server = QuayServer(workspace, idle_seconds=0)
+        try:
+            assert server.subscriber_queue_size == 4096
+            synchronous = server.store._conn.execute("PRAGMA synchronous").fetchone()[0]  # noqa: SLF001
+            assert synchronous == 1  # SQLite NORMAL
+        finally:
+            server.close()
+
     def test_connection_cleanup_removes_subscriptions(self, server: QuayServer):
         for _ in range(3):
             with SubscriptionStream(server.socket_path, timeout=5.0) as live:
@@ -396,6 +506,25 @@ class TestClientAndServerLifecycle:
         assert not socket_path.exists(), "an idle daemon must exit on its own"
         assert server.stop_reason == "idle"
         server.close()
+
+    def test_active_subscription_inhibits_idle_shutdown(self, workspace: Path):
+        server = QuayServer(
+            workspace, idle_seconds=0.25, heartbeat_seconds=5.0, synchronous="NORMAL"
+        )
+        server.start()
+        live = SubscriptionStream(server.socket_path, timeout=5.0).open()
+        try:
+            time.sleep(0.6)
+            assert server.socket_path.exists()
+            assert server.stop_reason is None
+            live.close()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and server.socket_path.exists():
+                time.sleep(0.05)
+            assert server.stop_reason == "idle"
+        finally:
+            live.close()
+            server.close()
 
     def test_reap_thread_expires_leases_automatically(self, server: QuayServer, client: QuayClient):
         client.request(
@@ -450,13 +579,21 @@ class TestOperations:
     def test_work_operations_round_trip(self, client: QuayClient):
         claim = client.request("work_claim", {"key": "k", "executor": "factory", "lease_seconds": 60})["event"]
         assert claim["payload"]["state"] == "claimed"
+        token = claim["payload"]["fencing_token"]
         heartbeat = client.request(
-            "work_heartbeat", {"key": "k", "executor": "factory", "causation_id": claim["seq"], "lease_seconds": 120}
+            "work_heartbeat",
+            {
+                "key": "k", "executor": "factory", "causation_id": claim["seq"],
+                "lease_seconds": 120, "fencing_token": token,
+            },
         )["event"]
         assert heartbeat["payload"]["state"] == "in_flight"
         done = client.request(
             "work_complete",
-            {"key": "k", "executor": "factory", "causation_id": heartbeat["seq"], "evidence": {"commit": "abc"}},
+            {
+                "key": "k", "executor": "factory", "causation_id": heartbeat["seq"],
+                "evidence": {"commit": "abc"}, "fencing_token": token,
+            },
         )["event"]
         assert done["payload"]["state"] == "done"
         listed = client.request("work_list")["work"]
@@ -475,7 +612,9 @@ class TestOperations:
 
     def test_kinds_describes_the_schema(self, client: QuayClient):
         kinds = client.request("kinds")["kinds"]
-        assert {item["kind"] for item in kinds} == {"signal", "work", "note", "metric", "generic"}
+        assert {item["kind"] for item in kinds} == {
+            "signal", "work", "handoff", "note", "metric", "generic"
+        }
 
     def test_operations_list_is_stable(self):
         assert "emit" in OP_NAMES

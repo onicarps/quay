@@ -153,7 +153,9 @@ class TestMcpProtocol:
         assert schemas["quay_log"]["required"] == ["limit"]
         assert schemas["quay_status"]["required"] == []
         assert schemas["quay_work_claim"]["required"] == ["key", "executor"]
-        assert schemas["quay_work_complete"]["required"] == ["key", "executor", "evidence"]
+        assert schemas["quay_work_complete"]["required"] == [
+            "key", "executor", "evidence", "fencing_token"
+        ]
 
     def test_notifications_get_no_reply(self, session: McpSession):
         session.notify("notifications/initialized")
@@ -214,7 +216,13 @@ class TestMcpTools:
         done = payload_of(
             session.call(
                 "quay_work_complete",
-                {"key": "k", "executor": "factory", "evidence": {"ok": True}},
+                {
+                    "key": "k",
+                    "executor": "factory",
+                    "evidence": {"ok": True},
+                    "causation_id": claimed["seq"],
+                    "fencing_token": claimed["payload"]["fencing_token"],
+                },
             )
         )["event"]
         assert done["payload"]["state"] == "done"
@@ -241,7 +249,10 @@ class TestMcpTools:
         assert "limit" in text_of(response)
 
     def test_work_complete_requires_non_empty_evidence_in_a_tool_error(self, session: McpSession):
-        response = session.call("quay_work_complete", {"key": "k", "executor": "e", "evidence": {}})
+        response = session.call(
+            "quay_work_complete",
+            {"key": "k", "executor": "e", "evidence": {}, "fencing_token": 1},
+        )
         assert response["result"]["isError"] is True
         assert "evidence" in text_of(response)
 

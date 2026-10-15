@@ -125,6 +125,21 @@ class FakeLive:
         return None
 
 
+class RecoveryErrorLive:
+    """A subscription stand-in that terminates with a recovery error."""
+
+    def __init__(self):
+        self.frames = [
+            {
+                "type": "recovery_error",
+                "error": {"code": "recovery_stalled", "message": "no progress"},
+            }
+        ]
+
+    def poll(self, timeout: float):
+        return self.frames.pop(0) if self.frames else None
+
+
 def scripted_reader(*presses: str, on_read=None):
     """A ``terminal_session`` stand-in that replays scripted key presses.
 
@@ -505,6 +520,11 @@ class TestTuiApp:
         app.handle_key("2", client)
         assert app.filter_label == "signal"
 
+    def test_empty_key_is_ignored(self):
+        app = TuiApp("/tmp/x.sock")
+        assert app.handle_key("", FakeClient()) is True
+        assert app.filter_index == 0
+
     def test_detail_toggle(self):
         app = TuiApp("/tmp/x.sock")
         before = app.dashboard.detail
@@ -755,6 +775,22 @@ class TestTuiLoopResizeAndRefresh:
         # The first frame paints row 0 from its first column exactly once: the
         # idle iterations that follow emit nothing at all.
         assert segments[1].count("\x1b[1;1H") == 1
+
+    def test_recovery_failure_is_visible_and_ends_stream_processing(self):
+        app = TuiApp("/tmp/x.sock")
+        output = io.StringIO()
+
+        code = app._loop(  # noqa: SLF001 - the documented test seam
+            FakeClient(),
+            RecoveryErrorLive(),
+            reader_factory=scripted_reader(),
+            output=output,
+            max_iterations=2,
+            size_getter=ScriptedSize(self.LARGE),
+        )
+
+        assert code == 0
+        assert app.message == "stream ended: recovery_stalled"
 
     def test_ctrl_l_forces_a_full_repaint_of_an_unchanged_model(self):
         app = TuiApp("/tmp/x.sock")

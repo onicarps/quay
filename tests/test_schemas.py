@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from quay.schemas import (
+    HANDOFF_TOPIC_PATTERN,
     KINDS,
     MAX_CANONICAL_PAYLOAD_BYTES,
     SCHEMA_VERSION,
@@ -21,7 +22,7 @@ def test_schema_version_is_pinned():
 
 
 def test_declared_kinds_are_stable():
-    assert KINDS == ("signal", "work", "note", "metric", "generic")
+    assert KINDS == ("signal", "work", "handoff", "note", "metric", "generic")
 
 
 @pytest.mark.parametrize(
@@ -30,6 +31,7 @@ def test_declared_kinds_are_stable():
         ("signal", "signal"),
         ("SIGNAL", "signal"),
         ("  work ", "work"),
+        ("handoff", "handoff"),
         ("note", "note"),
         ("metric", "metric"),
         ("generic", "generic"),
@@ -145,6 +147,80 @@ class TestWork:
             validate_payload("work", {"executor": "e", "state": "claimed"})
         assert excinfo.value.code == "missing_field"
 
+    def test_fencing_token_must_be_a_positive_integer(self):
+        assert validate_payload(
+            "work",
+            {"key": "k", "executor": "e", "state": "claimed", "fencing_token": 2},
+        )["fencing_token"] == 2
+        for bad in (0, -1, True, "2"):
+            with pytest.raises(ValidationError) as excinfo:
+                validate_payload(
+                    "work",
+                    {"key": "k", "executor": "e", "state": "claimed", "fencing_token": bad},
+                )
+            assert excinfo.value.code == "invalid_fencing_token"
+
+
+class TestHandoff:
+    def test_bounded_handoff_matches_envelope_and_normalizes_links(self):
+        event = normalize_event(
+            topic="swarm/codex/handoff",
+            producer="agy",
+            kind="handoff",
+            payload={
+                "from": "agy",
+                "to": "codex",
+                "summary": "Implement Phase 1",
+                "initiative": "quay",
+                "links": [r"okf\status.md"],
+                "action": {"type": "implement"},
+            },
+            causation_id=9,
+            root_causation_id=3,
+        )
+        assert event["payload"]["links"] == ["okf/status.md"]
+        assert event["root_causation_id"] == 3
+
+    @pytest.mark.parametrize(
+        "topic,producer,payload,code",
+        [
+            (
+                "okf/handoff",
+                "agy",
+                {"from": "agy", "to": "codex", "summary": "x"},
+                "invalid_handoff_topic",
+            ),
+            (
+                "swarm/codex/handoff",
+                "agy",
+                {"from": "factory", "to": "codex", "summary": "x"},
+                "handoff_sender_mismatch",
+            ),
+            (
+                "swarm/codex/handoff",
+                "agy",
+                {"from": "agy", "to": "factory", "summary": "x"},
+                "handoff_recipient_mismatch",
+            ),
+        ],
+    )
+    def test_rejects_route_identity_mismatches(self, topic, producer, payload, code):
+        with pytest.raises(ValidationError) as excinfo:
+            normalize_event(topic=topic, producer=producer, kind="handoff", payload=payload)
+        assert excinfo.value.code == code
+
+    def test_links_are_bounded(self):
+        with pytest.raises(ValidationError) as excinfo:
+            validate_payload(
+                "handoff",
+                {"from": "a", "to": "b", "summary": "x", "links": ["x"] * 11},
+            )
+        assert excinfo.value.code == "invalid_links"
+
+    @pytest.mark.parametrize("recipient", ["agent@host", "agent+role"])
+    def test_handoff_recipient_pattern_uses_only_topic_characters(self, recipient):
+        assert HANDOFF_TOPIC_PATTERN.fullmatch(f"swarm/{recipient}/handoff") is None
+
 
 class TestNoteMetricGeneric:
     def test_note_requires_text(self):
@@ -184,9 +260,18 @@ class TestNoteMetricGeneric:
 class TestEnvelope:
     def test_normalize_event_returns_only_caller_fields(self):
         event = normalize_event(topic="okf/handoff", producer="factory", payload={"a": 1})
-        assert set(event) == {"kind", "topic", "producer", "payload", "causation_id", "correlation_id"}
+        assert set(event) == {
+            "kind",
+            "topic",
+            "producer",
+            "payload",
+            "causation_id",
+            "root_causation_id",
+            "correlation_id",
+        }
         assert event["correlation_id"] is None
         assert event["causation_id"] is None
+        assert event["root_causation_id"] is None
 
     def test_topic_is_validated(self):
         for bad in ("", "-leading", "has space", "x" * 201, None, 5):
@@ -210,6 +295,12 @@ class TestEnvelope:
         with pytest.raises(ValidationError) as excinfo:
             normalize_event(topic="t", producer="p", payload={}, correlation_id="has space")
         assert excinfo.value.code == "invalid_correlation"
+
+    def test_root_causation_id_must_be_positive_int(self):
+        for bad in (0, -1, "3", 1.0, True):
+            with pytest.raises(ValidationError) as excinfo:
+                normalize_event(topic="t", producer="p", payload={}, root_causation_id=bad)
+            assert excinfo.value.code == "invalid_root_causation"
 
     def test_payload_size_is_bounded(self):
         with pytest.raises(ValidationError) as excinfo:

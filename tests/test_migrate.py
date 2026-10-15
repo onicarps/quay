@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+import quay.migrate as migrate_module
 from quay.migrate import (
     MigrationReport,
     migrate_changi,
@@ -179,6 +180,7 @@ class TestTranslation:
         assert translated["kind"] == "work"
         assert translated["payload"]["state"] == "done"
         assert translated["payload"]["key"] == "job-1"
+        assert "fencing_token" not in translated["payload"]
         assert translated["payload"]["evidence"]["exit_status"] == 0
 
     def test_failed_receipt_maps_to_failed_work(self):
@@ -198,6 +200,7 @@ class TestTranslation:
         )
         assert translated["kind"] == "work"
         assert translated["payload"]["state"] == "failed"
+        assert "fencing_token" not in translated["payload"]
         assert translated["payload"]["evidence"] == {"exit_status": 17}
 
     def test_receipt_without_executor_is_downgraded_with_a_warning(self):
@@ -272,6 +275,65 @@ class TestMigration:
         assert planes["work"]["done"] == 1
         assert planes["signal"]["claimed"] == 1
 
+    def test_legacy_terminal_work_uses_the_reconstructed_claim_token(
+        self, changi_db: Path, store: LedgerStore
+    ):
+        report = migrate_changi(changi_db, store)
+        assert report.skipped == 0
+        work_events = store.query(kind="work", order="asc")
+        assert [event["payload"]["state"] for event in work_events] == ["claimed", "done"]
+        assert [event["payload"]["fencing_token"] for event in work_events] == [1, 1]
+        assert work_events[1]["causation_id"] == work_events[0]["seq"]
+
+        store.rebuild_projections()
+        row = store.list_work()[0]
+        assert (row["state"], row["executor"], row["fencing_token"]) == (
+            "done",
+            "worker-7",
+            1,
+        )
+        assert store.verify()["ok"] is True
+
+    def test_legacy_terminal_uses_the_token_assigned_to_a_reclaim(
+        self, changi_db: Path, store: LedgerStore
+    ):
+        claimed = store.append(
+            topic="work/queue",
+            producer="worker-7",
+            payload={"key": "job-42", "executor": "worker-7", "state": "claimed"},
+            kind="work",
+        )
+        store.append(
+            topic="work/queue",
+            producer="worker-7",
+            payload={
+                "key": "job-42",
+                "executor": "worker-7",
+                "state": "abandoned",
+                "reason": "legacy import setup",
+                "fencing_token": 1,
+            },
+            kind="work",
+            causation_id=claimed["seq"],
+        )
+
+        report = migrate_changi(changi_db, store)
+        assert report.migrated == 3
+        assert report.skipped == 0
+        row = next(item for item in store.list_work() if item["key"] == "job-42")
+        assert (row["state"], row["executor"], row["fencing_token"]) == (
+            "done",
+            "worker-7",
+            2,
+        )
+        imported = [
+            event
+            for event in store.query(kind="work", order="asc")
+            if event["payload"]["key"] == "job-42"
+        ]
+        assert [event["payload"]["fencing_token"] for event in imported] == [1, 1, 2, 2]
+        assert store.verify()["ok"] is True
+
     def test_causal_links_are_remapped_to_new_sequence_numbers(self, tmp_path: Path, store: LedgerStore):
         path = changi_ledger(
             tmp_path / "chain.db",
@@ -289,6 +351,44 @@ class TestMigration:
         events = store.query(limit=10)
         child = [event for event in events if event["payload"]["state"] == "cleared"][0]
         parent = [event for event in events if event["payload"]["state"] == "pending"][0]
+        assert child["causation_id"] == parent["seq"]
+
+    def test_fallback_resynchronizes_sequences_after_a_skipped_record(
+        self, tmp_path: Path, store: LedgerStore, monkeypatch: pytest.MonkeyPatch
+    ):
+        path = changi_ledger(
+            tmp_path / "fallback-chain.db",
+            [
+                {"payload": {"force_skip": True}},
+                {"payload": {"batch": "survivor-a"}},
+                {"payload": {"batch": "survivor-b"}},
+                {"payload": {"chain": "parent"}},
+                {"payload": {"chain": "child"}, "causation_id": 4},
+            ],
+        )
+
+        class FallbackStore:
+            def last_seq(self):
+                return store.last_seq()
+
+            def append_batch(self, events):
+                if any(event["payload"].get("force_skip") for event in events):
+                    raise StoreError("forced_batch_retry", "exercise row fallback")
+                return store.append_batch(events)
+
+            def append(self, **event):
+                if event["payload"].get("force_skip"):
+                    raise StoreError("forced_skip", "exercise skipped-row recovery")
+                return store.append(**event)
+
+        monkeypatch.setattr(migrate_module, "BATCH_SIZE", 3)
+        report = migrate_changi(path, FallbackStore())  # type: ignore[arg-type]
+
+        assert (report.migrated, report.skipped) == (4, 1)
+        events = store.query(order="asc")
+        parent = next(event for event in events if event["payload"].get("chain") == "parent")
+        child = next(event for event in events if event["payload"].get("chain") == "child")
+        assert parent["seq"] == 3
         assert child["causation_id"] == parent["seq"]
 
     def test_links_pointing_at_unmigrated_events_are_dropped_with_a_warning(
@@ -351,6 +451,9 @@ class TestMigration:
         assert second.migrated == 2
         assert second.skipped == 1
         assert any("done" in warning for warning in second.warnings)
+        work = store.list_work()
+        assert len(work) == 1
+        assert (work[0]["state"], work[0]["fencing_token"]) == ("done", 1)
         assert store.verify()["ok"] is True
 
     def test_empty_source_is_reported_as_zero(self, tmp_path: Path, store: LedgerStore):

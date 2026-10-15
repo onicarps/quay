@@ -14,6 +14,34 @@ Invariants
    commit atomically: either every event lands or none does.
 4. Pruning is explicit, previewable, and records a checkpoint so that
    verification of the retained suffix stays possible.
+
+Work-plane fencing
+------------------
+The ``work`` plane is fenced so two agents cannot take over one unit of work:
+
+* ``works.fencing_token`` is a monotonically increasing integer. The first
+  successful claim of a key receives ``1``; every successful reclaim of the
+  same key increments the previous token by exactly one. Tokens never decrease
+  and never reset during :meth:`LedgerStore.rebuild_projections`.
+* A claim (``state == "claimed"``) is a compare-and-set evaluated inside the
+  write transaction, after ``BEGIN IMMEDIATE`` and before the event body is
+  hashed. It succeeds only when the key is absent, the projected state is
+  ``expired`` or ``abandoned``, or an active ``claimed``/``in_flight`` lease has
+  already lapsed. Otherwise it raises
+  ``StoreError("claim_conflict", ...)`` and appends nothing.
+* Every other work state (``in_flight``, ``done``, ``failed``, ``abandoned``,
+  ``expired``) is a fenced transition. It must present the currently projected
+  ``executor`` (else ``StoreError("owner_mismatch", ...)``) and the exact
+  ``fencing_token`` (else ``StoreError("fencing_token_mismatch", ...)``,
+  including when the token is missing). A rejected transition appends no event
+  and moves no counter.
+* The ledger owns the token on a claim: the assigned value is written into the
+  claim event's payload, so it is covered by that event's hash, and a
+  caller-supplied value is ignored rather than trusted.
+* Legacy compatibility is limited to replay: work events stored before this
+  column existed carry no token and deterministically replay as token ``1``
+  (or the current projected token) until a later token-bearing claim advances
+  it. New mutating transitions are always fenced.
 """
 
 from __future__ import annotations
@@ -46,6 +74,19 @@ MAX_BATCH = 10_000
 
 #: Busy retry budget for concurrent writers, in seconds.
 WRITE_RETRY_SECONDS = 5.0
+
+#: Payload field carrying the work-plane fencing token.
+FENCING_TOKEN_FIELD = "fencing_token"
+LEASE_EXPIRES_AT_FIELD = "lease_expires_at"
+
+#: Work states whose transition must name the projected owner and token.
+FENCED_WORK_STATES = frozenset({"in_flight", "done", "failed", "abandoned", "expired"})
+
+#: Projected states a new claim may take over from without a lapsed lease.
+CLAIMABLE_WORK_STATES = frozenset({"expired", "abandoned"})
+
+#: Producer recorded for lease-expiry events appended by the reaper.
+REAP_PRODUCER = "quay.system"
 
 #: The single note written when a fresh ledger is auto-initialized. It gives a
 #: brand-new workspace one visible record so the cockpit has proof of life.
@@ -80,6 +121,10 @@ __all__ = [
     "GENESIS_TOPIC",
     "GENESIS_PRODUCER",
     "GENESIS_PAYLOAD",
+    "FENCED_WORK_STATES",
+    "FENCING_TOKEN_FIELD",
+    "CLAIMABLE_WORK_STATES",
+    "REAP_PRODUCER",
     "LedgerStore",
     "StoreError",
     "utc_now",
@@ -228,6 +273,7 @@ class LedgerStore:
                 ts             TEXT NOT NULL,
                 schema_version TEXT NOT NULL,
                 causation_id   INTEGER,
+                root_causation_id INTEGER,
                 correlation_id TEXT,
                 payload        TEXT NOT NULL,
                 body           TEXT NOT NULL,
@@ -264,11 +310,22 @@ class LedgerStore:
                 correlation_id   TEXT,
                 updated_seq      INTEGER NOT NULL,
                 lease_expires_at TEXT,
-                title            TEXT
+                title            TEXT,
+                fencing_token    INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS work_fences (
+                key              TEXT PRIMARY KEY,
+                state            TEXT NOT NULL,
+                executor         TEXT NOT NULL,
+                fencing_token    INTEGER NOT NULL,
+                lease_expires_at TEXT,
+                updated_seq      INTEGER NOT NULL
             );
             """
         )
         self._conn.commit()
+        self._ensure_root_causation_column()
+        self._ensure_work_fencing_column()
         with self._lock:
             self._set_meta_if_absent("format_version", str(LEDGER_FORMAT_VERSION))
             self._set_meta_if_absent("genesis_hash", GENESIS_HASH)
@@ -277,6 +334,76 @@ class LedgerStore:
             self._set_meta_if_absent("created_at", utc_now())
             self._conn.commit()
         self._chmod_private(self.path)
+
+    def _ensure_root_causation_column(self) -> None:
+        """Add and index root causation on ledgers created before turn ancestry."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(events)").fetchall()
+            }
+            if "root_causation_id" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE events ADD COLUMN root_causation_id INTEGER"
+                )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_root_cause "
+                "ON events(root_causation_id)"
+            )
+            self._conn.execute("COMMIT")
+        except sqlite3.OperationalError as exc:
+            self._conn.execute("ROLLBACK")
+            if "duplicate column name" in str(exc).lower():
+                # A concurrent first-open won the ALTER. The retrying opener
+                # will create the idempotent index on its next initialization.
+                return
+            raise
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def _ensure_work_fencing_column(self) -> None:
+        """Add ``works.fencing_token`` to a ledger written before fencing.
+
+        Idempotent: a fresh table already declares the column, and an existing
+        ledger is migrated in place with ``DEFAULT 1`` so every projected row
+        keeps a valid token. Existing ``events`` rows are untouched.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(works)").fetchall()
+            }
+            if FENCING_TOKEN_FIELD not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE works ADD COLUMN {FENCING_TOKEN_FIELD} "
+                    "INTEGER NOT NULL DEFAULT 1"
+                )
+            # Seed the durable high-water table when upgrading a ledger whose
+            # work projection already contains fenced or legacy-token rows.
+            self._conn.execute(
+                "INSERT INTO work_fences(key, state, executor, fencing_token, "
+                "lease_expires_at, updated_seq) "
+                "SELECT key, state, executor, fencing_token, lease_expires_at, updated_seq "
+                "FROM works WHERE 1 "
+                "ON CONFLICT(key) DO UPDATE SET state = excluded.state, "
+                "executor = excluded.executor, fencing_token = excluded.fencing_token, "
+                "lease_expires_at = excluded.lease_expires_at, updated_seq = excluded.updated_seq "
+                "WHERE excluded.fencing_token > work_fences.fencing_token "
+                "OR (excluded.fencing_token = work_fences.fencing_token "
+                "AND excluded.updated_seq > work_fences.updated_seq)"
+            )
+            self._conn.execute("COMMIT")
+        except sqlite3.OperationalError as exc:
+            self._conn.execute("ROLLBACK")
+            if "duplicate column name" in str(exc).lower():
+                return
+            raise
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     # ------------------------------------------------------------- meta helpers
 
@@ -317,6 +444,7 @@ class LedgerStore:
             "ts": row["ts"],
             "schema_version": row["schema_version"],
             "causation_id": row["causation_id"],
+            "root_causation_id": row["root_causation_id"],
             "correlation_id": row["correlation_id"],
             "payload": json.loads(row["payload"]),
             "prev_hash": row["prev_hash"],
@@ -383,6 +511,7 @@ class LedgerStore:
         state: str | None = None,
         correlation_id: str | None = None,
         causation_id: int | None = None,
+        root_causation_id: int | None = None,
         since_seq: int | None = None,
         until_seq: int | None = None,
         since_ts: str | None = None,
@@ -414,6 +543,9 @@ class LedgerStore:
         if causation_id is not None:
             clauses.append("causation_id = ?")
             params.append(int(causation_id))
+        if root_causation_id is not None:
+            clauses.append("root_causation_id = ?")
+            params.append(int(root_causation_id))
         if since_seq is not None:
             clauses.append("seq >= ?")
             params.append(int(since_seq))
@@ -546,10 +678,11 @@ class LedgerStore:
         producer: str,
         ts: str,
         causation_id: int | None,
+        root_causation_id: int | None,
         correlation_id: str | None,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        return {
+        body = {
             "seq": seq,
             "prev_hash": prev_hash,
             "kind": kind,
@@ -561,6 +694,12 @@ class LedgerStore:
             "correlation_id": correlation_id,
             "payload": payload,
         }
+        # Legacy rows predate this envelope field. Omitting a null value keeps
+        # their canonical bodies and hashes verifiable after the SQL migration,
+        # while a supplied root remains cryptographically bound into new rows.
+        if root_causation_id is not None:
+            body["root_causation_id"] = root_causation_id
+        return body
 
     def append(
         self,
@@ -570,6 +709,7 @@ class LedgerStore:
         payload: Mapping[str, Any] | None = None,
         kind: str = "generic",
         causation_id: int | None = None,
+        root_causation_id: int | None = None,
         correlation_id: str | None = None,
         ts: str | None = None,
     ) -> dict[str, Any]:
@@ -582,6 +722,7 @@ class LedgerStore:
                     "payload": payload,
                     "kind": kind,
                     "causation_id": causation_id,
+                    "root_causation_id": root_causation_id,
                     "correlation_id": correlation_id,
                     "ts": ts,
                 }
@@ -618,6 +759,7 @@ class LedgerStore:
                     payload=raw.get("payload"),
                     kind=raw.get("kind", "generic"),
                     causation_id=raw.get("causation_id"),
+                    root_causation_id=raw.get("root_causation_id"),
                     correlation_id=raw.get("correlation_id"),
                 )
             except ValidationError as exc:
@@ -627,85 +769,214 @@ class LedgerStore:
         with self._lock:
 
             def _write() -> list[dict[str, Any]]:
-                written: list[dict[str, Any]] = []
-                deltas: dict[str, int] = {}
-                try:
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    seq = self._next_seq()
-                    prev = self._current_head_hash()
-                    for item in prepared:
-                        ts = item["ts"] or utc_now()
-                        if not isinstance(ts, str):
-                            raise StoreError("invalid_ts", "ts must be an ISO-8601 string")
-                        validate_ts(ts)
-                        body = self._build_body(
-                            seq=seq,
-                            prev_hash=prev,
-                            kind=item["kind"],
-                            topic=item["topic"],
-                            producer=item["producer"],
-                            ts=ts,
-                            causation_id=item["causation_id"],
-                            correlation_id=item["correlation_id"],
-                            payload=item["payload"],
-                        )
-                        payload_text = item["payload_text"]
-                        body_text = canonical_body_text(body, payload_text)
-                        digest = chain_digest(prev, body_text.encode("utf-8"))
-                        self._validate_links(seq, item)
-                        self._conn.execute(
-                            "INSERT INTO events(seq, kind, topic, producer, ts, schema_version, "
-                            "causation_id, correlation_id, payload, body, prev_hash, hash) "
-                            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            (
-                                seq,
-                                item["kind"],
-                                item["topic"],
-                                item["producer"],
-                                ts,
-                                SCHEMA_VERSION,
-                                item["causation_id"],
-                                item["correlation_id"],
-                                payload_text,
-                                body_text,
-                                prev,
-                                digest,
-                            ),
-                        )
-                        event = {
-                            "seq": seq,
-                            "kind": item["kind"],
-                            "topic": item["topic"],
-                            "producer": item["producer"],
-                            "ts": ts,
-                            "schema_version": SCHEMA_VERSION,
-                            "causation_id": item["causation_id"],
-                            "correlation_id": item["correlation_id"],
-                            "payload": item["payload"],
-                            "prev_hash": prev,
-                            "hash": digest,
-                        }
-                        self._project(event, deltas)
-                        written.append(event)
-                        prev = digest
-                        seq += 1
-                    self._apply_deltas(deltas)
-                    self._conn.execute("COMMIT")
-                except sqlite3.OperationalError as exc:
-                    self._conn.execute("ROLLBACK")
-                    if self._is_busy(exc):
-                        # Let the retry loop in _commit_with_retry try again.
-                        raise
-                    raise StoreError("write_failed", f"ledger write failed: {exc}") from exc
-                except sqlite3.Error as exc:
-                    self._conn.execute("ROLLBACK")
-                    raise StoreError("write_failed", f"ledger write failed: {exc}") from exc
-                except Exception:
-                    self._conn.execute("ROLLBACK")
-                    raise
-                return written
+                self._conn.execute("BEGIN IMMEDIATE")
+                return self._append_prepared(prepared)
 
             return self._commit_with_retry(_write)
+
+    def _append_prepared(self, prepared: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Write prepared items inside a transaction the caller already opened.
+
+        The caller holds ``self._lock`` and has issued ``BEGIN IMMEDIATE``, so
+        the sequence number, the head hash, the claim compare-and-set, and the
+        canonical body hash all read one serialized snapshot. On any failure the
+        transaction is rolled back: a rejected event neither lands nor moves a
+        counter.
+        """
+        written: list[dict[str, Any]] = []
+        deltas: dict[str, int] = {}
+        try:
+            seq = self._next_seq()
+            prev = self._current_head_hash()
+            for item in prepared:
+                ts = item["ts"] or utc_now()
+                if not isinstance(ts, str):
+                    raise StoreError("invalid_ts", "ts must be an ISO-8601 string")
+                validate_ts(ts)
+                self._validate_links(seq, item)
+                payload = item["payload"]
+                payload_text = item["payload_text"]
+                if item["kind"] == "work":
+                    # Claim tokens are assigned here, after the write lock is
+                    # held and before the body is hashed, so the exact token is
+                    # part of the event's own canonical body and digest.
+                    payload, payload_text = self._fence_work_payload(payload, payload_text)
+                body = self._build_body(
+                    seq=seq,
+                    prev_hash=prev,
+                    kind=item["kind"],
+                    topic=item["topic"],
+                    producer=item["producer"],
+                    ts=ts,
+                    causation_id=item["causation_id"],
+                    root_causation_id=item["root_causation_id"],
+                    correlation_id=item["correlation_id"],
+                    payload=payload,
+                )
+                body_text = canonical_body_text(body, payload_text)
+                digest = chain_digest(prev, body_text.encode("utf-8"))
+                self._conn.execute(
+                    "INSERT INTO events(seq, kind, topic, producer, ts, schema_version, "
+                    "causation_id, root_causation_id, correlation_id, payload, body, prev_hash, hash) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        seq,
+                        item["kind"],
+                        item["topic"],
+                        item["producer"],
+                        ts,
+                        SCHEMA_VERSION,
+                        item["causation_id"],
+                        item["root_causation_id"],
+                        item["correlation_id"],
+                        payload_text,
+                        body_text,
+                        prev,
+                        digest,
+                    ),
+                )
+                event = {
+                    "seq": seq,
+                    "kind": item["kind"],
+                    "topic": item["topic"],
+                    "producer": item["producer"],
+                    "ts": ts,
+                    "schema_version": SCHEMA_VERSION,
+                    "causation_id": item["causation_id"],
+                    "root_causation_id": item["root_causation_id"],
+                    "correlation_id": item["correlation_id"],
+                    "payload": payload,
+                    "prev_hash": prev,
+                    "hash": digest,
+                }
+                self._project(event, deltas)
+                written.append(event)
+                prev = digest
+                seq += 1
+            self._apply_deltas(deltas)
+            self._conn.execute("COMMIT")
+        except sqlite3.OperationalError as exc:
+            self._conn.execute("ROLLBACK")
+            if self._is_busy(exc):
+                # Let the retry loop in _commit_with_retry try again.
+                raise
+            raise StoreError("write_failed", f"ledger write failed: {exc}") from exc
+        except sqlite3.Error as exc:
+            self._conn.execute("ROLLBACK")
+            raise StoreError("write_failed", f"ledger write failed: {exc}") from exc
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return written
+
+    # ------------------------------------------------------------ work fencing
+
+    def _fence_work_payload(
+        self, payload: dict[str, Any], payload_text: str
+    ) -> tuple[dict[str, Any], str]:
+        """Fence one ``work`` payload and return ``(payload, canonical_text)``.
+
+        A claim is a compare-and-set that the ledger tokenizes; any other state
+        is a transition that must name the projected owner and token.
+        """
+        state = str(payload["state"])
+        key = str(payload["key"])
+        row = self._work_authority(key)
+        trusted_now = datetime.now(timezone.utc)
+        fenced = dict(payload)
+        if state == "claimed":
+            fenced[FENCING_TOKEN_FIELD] = self._claim_fencing_token(
+                row, key, trusted_now
+            )
+        elif row is None or state not in FENCED_WORK_STATES:
+            # Not a transition of a known record; projection reports it.
+            return payload, payload_text
+        else:
+            projected_token = int(row[FENCING_TOKEN_FIELD])
+            supplied = payload.get(FENCING_TOKEN_FIELD)
+            if supplied is None:
+                raise StoreError(
+                    "fencing_token_mismatch",
+                    f"work '{key}' transition to '{state}' must present its fencing_token",
+                    {"key": key, "state": state, "reason": "missing", "expected": projected_token},
+                )
+            if str(payload["executor"]) != str(row["executor"]):
+                raise StoreError(
+                    "owner_mismatch",
+                    f"work '{key}' is owned by '{row['executor']}', not '{payload['executor']}'",
+                    {
+                        "key": key,
+                        "state": state,
+                        "owner": str(row["executor"]),
+                        "executor": str(payload["executor"]),
+                    },
+                )
+            if int(supplied) != projected_token:
+                raise StoreError(
+                    "fencing_token_mismatch",
+                    f"work '{key}' fencing token is {projected_token}, not {int(supplied)}",
+                    {
+                        "key": key,
+                        "state": state,
+                        "expected": projected_token,
+                        "presented": int(supplied),
+                    },
+                )
+
+        # Lease authority uses a store-generated wall-clock deadline. The
+        # caller's envelope timestamp remains historical metadata and cannot
+        # extend a lease or make an existing lease appear expired.
+        if state in ("claimed", "in_flight") and payload.get("lease_seconds"):
+            fenced[LEASE_EXPIRES_AT_FIELD] = (
+                trusted_now + timedelta(seconds=int(payload["lease_seconds"]))
+            ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        else:
+            fenced.pop(LEASE_EXPIRES_AT_FIELD, None)
+        return fenced, canonical_json(fenced)
+
+    def _work_authority(self, key: str) -> sqlite3.Row | None:
+        """Return live projection state or its durable pruned-history fence."""
+        row = self._conn.execute(
+            f"SELECT state, executor, {FENCING_TOKEN_FIELD}, lease_expires_at "
+            "FROM works WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row is not None:
+            return row
+        return self._conn.execute(
+            f"SELECT state, executor, {FENCING_TOKEN_FIELD}, lease_expires_at "
+            "FROM work_fences WHERE key = ?",
+            (key,),
+        ).fetchone()
+
+    def _claim_fencing_token(self, row: sqlite3.Row | None, key: str, moment: datetime) -> int:
+        """Return the token a claim should carry, or reject a live conflict."""
+        if row is None:
+            return 1
+        previous = int(row[FENCING_TOKEN_FIELD])
+        state = str(row["state"])
+        if state in CLAIMABLE_WORK_STATES:
+            return previous + 1
+        if state in ("claimed", "in_flight"):
+            expires = row["lease_expires_at"]
+            if expires is not None and parse_ts(str(expires)) <= moment:
+                return previous + 1
+            raise StoreError(
+                "claim_conflict",
+                f"work '{key}' is already claimed by '{row['executor']}'",
+                {
+                    "key": key,
+                    "state": state,
+                    "executor": str(row["executor"]),
+                    "lease_expires_at": None if expires is None else str(expires),
+                    "fencing_token": previous,
+                },
+            )
+        raise StoreError(
+            "claim_conflict",
+            f"work '{key}' is in terminal state '{state}' and cannot be reclaimed",
+            {"key": key, "state": state, "fencing_token": previous},
+        )
 
     def _current_head_hash(self) -> str:
         row = self._conn.execute(
@@ -717,9 +988,11 @@ class LedgerStore:
 
     def _validate_links(self, seq: int, item: Mapping[str, Any]) -> None:
         causation = item["causation_id"]
+        parent: sqlite3.Row | None = None
         if causation is not None:
             parent = self._conn.execute(
-                "SELECT seq, kind, correlation_id, payload FROM events WHERE seq = ?",
+                "SELECT seq, kind, correlation_id, payload, root_causation_id "
+                "FROM events WHERE seq = ?",
                 (int(causation),),
             ).fetchone()
             if parent is None:
@@ -742,6 +1015,37 @@ class LedgerStore:
                         "a work state change must name a work event with the same key",
                         {"causation_id": causation, "parent_kind": parent["kind"]},
                     )
+
+        root_causation = item.get("root_causation_id")
+        if root_causation is None:
+            return
+        root = int(root_causation)
+        if root >= seq:
+            raise StoreError(
+                "invalid_root_causation",
+                "root_causation_id must reference an earlier event",
+                {"root_causation_id": root, "seq": seq},
+            )
+        checkpoint_seq = int(self.meta("checkpoint_seq") or 0)
+        if root > checkpoint_seq:
+            root_row = self._conn.execute(
+                "SELECT 1 FROM events WHERE seq = ?", (root,)
+            ).fetchone()
+            if root_row is None:
+                raise StoreError(
+                    "unknown_root_causation",
+                    f"root_causation_id does not exist: {root}",
+                    {"root_causation_id": root},
+                )
+        if parent is not None:
+            expected = parent["root_causation_id"]
+            expected_root = int(parent["seq"] if expected is None else expected)
+            if root != expected_root:
+                raise StoreError(
+                    "root_causation_mismatch",
+                    "root_causation_id must match the causation parent's root",
+                    {"root_causation_id": root, "expected": expected_root},
+                )
 
     # -------------------------------------------------------------- projections
 
@@ -833,7 +1137,7 @@ class LedgerStore:
         key = str(payload["key"])
         state = str(payload["state"])
         row = self._conn.execute(
-            "SELECT state, lease_expires_at FROM works WHERE key = ?", (key,)
+            f"SELECT state, {FENCING_TOKEN_FIELD} FROM works WHERE key = ?", (key,)
         ).fetchone()
         previous_state = None if row is None else str(row["state"])
 
@@ -844,29 +1148,37 @@ class LedgerStore:
                 {"key": key, "state": state},
             )
         if previous_state is not None:
-            allowed = _WORK_TRANSITIONS.get(previous_state, set())
-            if state not in allowed:
-                raise StoreError(
-                    "invalid_transition",
-                    f"work '{key}' cannot move from '{previous_state}' to '{state}'",
-                    {"key": key, "from": previous_state, "to": state, "allowed": sorted(allowed)},
-                )
+            if state != "claimed":
+                # A claim is authorized by the atomic compare-and-set in
+                # _claim_fencing_token, which is the only path allowed to
+                # reclaim a lapsed, abandoned, or terminal record. Every other
+                # transition must be legal for the projected state.
+                allowed = _WORK_TRANSITIONS.get(previous_state, set())
+                if state not in allowed:
+                    raise StoreError(
+                        "invalid_transition",
+                        f"work '{key}' cannot move from '{previous_state}' to '{state}'",
+                        {"key": key, "from": previous_state, "to": state, "allowed": sorted(allowed)},
+                    )
             self._bump(deltas, f"work.{previous_state}", -1)
 
-        lease_expires_at = None
-        if state in ("claimed", "in_flight") and payload.get("lease_seconds"):
-            lease_expires_at = (
-                parse_ts(str(event["ts"]))
-                + timedelta(seconds=int(payload["lease_seconds"]))
-            ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        token = payload.get(FENCING_TOKEN_FIELD)
+        if isinstance(token, bool) or not isinstance(token, int) or token <= 0:
+            # A legacy event without a token keeps the projected token, or
+            # starts the key at token 1.
+            token = int(row[FENCING_TOKEN_FIELD]) if row is not None else 1
+
+        lease_expires_at = payload.get(LEASE_EXPIRES_AT_FIELD)
+        if lease_expires_at is not None:
+            lease_expires_at = str(lease_expires_at)
 
         self._conn.execute(
             "INSERT INTO works(key, state, executor, topic, correlation_id, updated_seq, "
-            "lease_expires_at, title) VALUES(?, ?, ?, ?, ?, ?, ?, ?) "
+            "lease_expires_at, title, fencing_token) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(key) DO UPDATE SET state = excluded.state, executor = excluded.executor, "
             "topic = excluded.topic, correlation_id = excluded.correlation_id, "
             "updated_seq = excluded.updated_seq, lease_expires_at = excluded.lease_expires_at, "
-            "title = excluded.title",
+            "title = excluded.title, fencing_token = excluded.fencing_token",
             (
                 key,
                 state,
@@ -876,9 +1188,38 @@ class LedgerStore:
                 int(event["seq"]),
                 lease_expires_at,
                 payload.get("title"),
+                int(token),
             ),
         )
+        self._remember_work_fence(event, int(token), lease_expires_at)
         self._bump(deltas, f"work.{state}", 1)
+
+    def _remember_work_fence(
+        self,
+        event: Mapping[str, Any],
+        token: int,
+        lease_expires_at: str | None,
+    ) -> None:
+        """Advance the per-key fence independently of prunable projections."""
+        payload = event["payload"]
+        self._conn.execute(
+            "INSERT INTO work_fences(key, state, executor, fencing_token, "
+            "lease_expires_at, updated_seq) VALUES(?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET state = excluded.state, "
+            "executor = excluded.executor, fencing_token = excluded.fencing_token, "
+            "lease_expires_at = excluded.lease_expires_at, updated_seq = excluded.updated_seq "
+            "WHERE excluded.fencing_token > work_fences.fencing_token "
+            "OR (excluded.fencing_token = work_fences.fencing_token "
+            "AND excluded.updated_seq > work_fences.updated_seq)",
+            (
+                str(payload["key"]),
+                str(payload["state"]),
+                str(payload["executor"]),
+                int(token),
+                lease_expires_at,
+                int(event["seq"]),
+            ),
+        )
 
     def rebuild_projections(self) -> dict[str, int]:
         """Recompute every derived table from ``events``.
@@ -940,22 +1281,31 @@ class LedgerStore:
             key = str(payload.get("key", "unknown"))
             state = str(payload.get("state", "claimed"))
             previous = self._conn.execute(
-                "SELECT state FROM works WHERE key = ?", (key,)
+                f"SELECT state, {FENCING_TOKEN_FIELD} FROM works WHERE key = ?", (key,)
             ).fetchone()
             if previous is not None:
                 self._bump(deltas, f"work.{previous['state']}", -1)
-            lease_expires_at = None
-            if state in ("claimed", "in_flight") and payload.get("lease_seconds"):
+            token = payload.get(FENCING_TOKEN_FIELD)
+            if isinstance(token, bool) or not isinstance(token, int) or token <= 0:
+                # A pre-fencing event replays as the current projected token,
+                # which is 1 until a later token-bearing claim advances it.
+                token = int(previous[FENCING_TOKEN_FIELD]) if previous is not None else 1
+            lease_expires_at = payload.get(LEASE_EXPIRES_AT_FIELD)
+            if lease_expires_at is not None:
+                lease_expires_at = str(lease_expires_at)
+            elif state in ("claimed", "in_flight") and payload.get("lease_seconds"):
+                # Compatibility for pre-0.3 rows, whose trusted deadline was
+                # derived from the only timestamp then stored in the event.
                 lease_expires_at = (
                     parse_ts(str(event["ts"])) + timedelta(seconds=int(payload["lease_seconds"]))
                 ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
             self._conn.execute(
                 "INSERT INTO works(key, state, executor, topic, correlation_id, updated_seq, "
-                "lease_expires_at, title) VALUES(?, ?, ?, ?, ?, ?, ?, ?) "
+                "lease_expires_at, title, fencing_token) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET state = excluded.state, executor = excluded.executor, "
                 "topic = excluded.topic, correlation_id = excluded.correlation_id, "
                 "updated_seq = excluded.updated_seq, lease_expires_at = excluded.lease_expires_at, "
-                "title = excluded.title",
+                "title = excluded.title, fencing_token = excluded.fencing_token",
                 (
                     key,
                     state,
@@ -965,8 +1315,10 @@ class LedgerStore:
                     int(event["seq"]),
                     lease_expires_at,
                     payload.get("title"),
+                    int(token),
                 ),
             )
+            self._remember_work_fence(event, int(token), lease_expires_at)
             self._bump(deltas, f"work.{state}", 1)
 
     # ------------------------------------------------------------------- leases
@@ -1005,31 +1357,68 @@ class LedgerStore:
         return expired
 
     def reap_expired_leases(self, *, now: str | None = None) -> list[dict[str, Any]]:
-        """Append an ``expired`` work event for every lapsed lease.
+        """Append one ``expired`` work event per lapsed lease, atomically.
 
-        Reaping is recorded in the log rather than applied as a silent
-        projection edit, so projections stay reproducible from events.
+        The eligible rows are selected and re-checked inside a single
+        ``BEGIN IMMEDIATE`` transaction, so a heartbeat committed before the
+        reap is honoured and one arriving during the reap waits for the batch
+        to land. Every ``expired`` event is written in one all-or-nothing batch
+        in deterministic ``updated_seq ASC`` order, carrying the current
+        ``fencing_token`` and the causal ``updated_seq``. Reaping is recorded in
+        the log rather than applied as a silent projection edit, so projections
+        stay reproducible from events.
         """
+        if self._closed:
+            raise StoreError("closed", "ledger is closed")
         moment = parse_ts(now) if now else datetime.now(timezone.utc)
         stamped = moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-        expired = self.expired_leases(now=stamped)
-        reaped: list[dict[str, Any]] = []
-        for item in expired:
-            event = self.append(
-                topic=item["topic"],
-                producer="quay.system",
-                kind="work",
-                causation_id=int(item["updated_seq"]),
-                correlation_id=item["correlation_id"],
-                payload={
-                    "key": item["key"],
-                    "executor": item["executor"],
-                    "state": "expired",
-                    "reason": f"lease expired at {stamped}",
-                },
-            )
-            reaped.append(event)
-        return reaped
+
+        with self._lock:
+
+            def _reap() -> list[dict[str, Any]]:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    prepared = self._prepare_expired_reap(moment, stamped)
+                except Exception:
+                    self._conn.execute("ROLLBACK")
+                    raise
+                if not prepared:
+                    self._conn.execute("COMMIT")
+                    return []
+                return self._append_prepared(prepared)
+
+            return self._commit_with_retry(_reap)
+
+    def _prepare_expired_reap(self, moment: datetime, stamped: str) -> list[dict[str, Any]]:
+        """Snapshot and re-check lapsed leases inside the open transaction."""
+        rows = self._conn.execute(
+            "SELECT * FROM works WHERE state IN ('claimed', 'in_flight') "
+            "AND lease_expires_at IS NOT NULL ORDER BY updated_seq ASC"
+        ).fetchall()
+        prepared: list[dict[str, Any]] = []
+        for row in rows:
+            if parse_ts(str(row["lease_expires_at"])) > moment:
+                continue
+            payload = {
+                "key": str(row["key"]),
+                "executor": str(row["executor"]),
+                "state": "expired",
+                "reason": f"lease expired at {stamped}",
+                FENCING_TOKEN_FIELD: int(row[FENCING_TOKEN_FIELD]),
+            }
+            try:
+                fields, payload_text = prepare_event(
+                    topic=row["topic"],
+                    producer=REAP_PRODUCER,
+                    payload=payload,
+                    kind="work",
+                    causation_id=int(row["updated_seq"]),
+                    correlation_id=row["correlation_id"],
+                )
+            except ValidationError as exc:
+                raise StoreError(exc.code, exc.message, exc.detail) from exc
+            prepared.append({**fields, "ts": stamped, "payload_text": payload_text})
+        return prepared
 
     # --------------------------------------------------------------- integrity
 
@@ -1042,6 +1431,7 @@ class LedgerStore:
             producer=str(row["producer"]),
             ts=str(row["ts"]),
             causation_id=row["causation_id"],
+            root_causation_id=row["root_causation_id"],
             correlation_id=row["correlation_id"],
             payload=json.loads(row["payload"]),
         )

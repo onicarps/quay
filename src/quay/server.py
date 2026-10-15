@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import PROTOCOL_VERSION
+from .cursors import CursorStore
 from .protocol import (
     ProtocolError,
     make_error,
@@ -55,7 +56,7 @@ from .workspace import (
 )
 
 #: Operations that mutate the ledger; they broadcast to subscribers afterwards.
-WRITE_OPS = frozenset({"emit", "emit_batch", "genesis", "work_claim", "work_heartbeat", "work_complete", "work_abandon", "work_reap", "prune", "import"})
+WRITE_OPS = frozenset({"emit", "emit_batch", "genesis", "work_claim", "work_heartbeat", "work_complete", "work_abandon", "work_reap", "cursor_deliver", "cursor_ack", "prune", "import"})
 
 #: Operations that any client may call.
 READ_OPS = frozenset(
@@ -71,6 +72,7 @@ READ_OPS = frozenset(
         "kinds",
         "verify",
         "work_list",
+        "cursor_get",
         "prune_preview",
         "subscribe",
         "unsubscribe",
@@ -304,8 +306,8 @@ class QuayServer:
         socket_path: str | os.PathLike[str] | None = None,
         idle_seconds: float = IDLE_SECONDS_DEFAULT,
         heartbeat_seconds: float = 10.0,
-        subscriber_queue_size: int = 256,
-        synchronous: str = "FULL",
+        subscriber_queue_size: int = 4096,
+        synchronous: str = "NORMAL",
         reap_interval_seconds: float = 30.0,
     ) -> None:
         self.paths = paths_for(workspace)
@@ -323,6 +325,7 @@ class QuayServer:
         self.subscriber_queue_size = int(subscriber_queue_size)
         self.reap_interval_seconds = float(reap_interval_seconds)
         self.store = LedgerStore(self.paths.database, synchronous=synchronous)
+        self.cursors = CursorStore(self.paths.root)
         self.instance_id = new_instance_id()
         self.pid = os.getpid()
         self.identity = process_start_identity(self.pid)
@@ -429,6 +432,21 @@ class QuayServer:
     def note_activity(self) -> None:
         self.last_activity = time.monotonic()
 
+    def is_idle(self, *, now: float | None = None) -> bool:
+        """Return whether idle shutdown is allowed at this instant.
+
+        Persistent subscriptions are daemon liveness claims: heartbeats are
+        intentionally not request frames, so request activity alone cannot be
+        used to decide that a bus-mode daemon is unused.
+        """
+        if self.idle_seconds <= 0:
+            return False
+        with self._connections_lock:
+            if any(connection.subscriptions for connection in self._connections.values()):
+                return False
+        moment = time.monotonic() if now is None else now
+        return moment - self.last_activity >= self.idle_seconds
+
     def health(self) -> dict[str, Any]:
         return {
             "pid": self.pid,
@@ -478,12 +496,13 @@ class QuayServer:
                 with contextlib.suppress(StoreError, WorkspaceError):
                     self._reap_expired()
                 next_reap = now + self.reap_interval_seconds
-            if self.idle_seconds > 0 and now - self.last_activity >= self.idle_seconds:
+            if self.is_idle(now=now):
                 self.request_stop("idle")
             time.sleep(0.1)
 
     def _reap_expired(self) -> None:
-        reaped = self.store.reap_expired_leases()
+        with self._write_lock:
+            reaped = self.store.reap_expired_leases()
         for event in reaped:
             self.broadcast_event(event)
 
@@ -681,6 +700,7 @@ class QuayServer:
             "state",
             "correlation_id",
             "causation_id",
+            "root_causation_id",
             "since_seq",
             "until_seq",
             "since_ts",
@@ -733,33 +753,80 @@ class QuayServer:
             "expired": self.store.expired_leases(),
         }, False
 
+    def _op_cursor_get(self, body, connection):
+        return {
+            "consumer": body.get("consumer"),
+            "cursor": self.cursors.get(body.get("consumer")),
+        }, False
+
+    def _op_cursor_deliver(self, body, connection):
+        seq = body.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            raise ProtocolError("invalid_cursor_seq", "seq must be an integer")
+        with self._write_lock:
+            if self.store.get(seq) is None:
+                raise ProtocolError("not_found", f"no event with seq {seq}", {"seq": seq})
+            cursor = self.cursors.begin_delivery(
+                body.get("consumer"),
+                seq,
+                body.get("idempotency_key"),
+                delivered_at=body.get("delivered_at"),
+            )
+        return {"consumer": body.get("consumer"), "cursor": cursor}, False
+
+    def _op_cursor_ack(self, body, connection):
+        cursor = self.cursors.acknowledge(
+            body.get("consumer"),
+            body.get("seq"),
+            idempotency_key=body.get("idempotency_key"),
+        )
+        return {"consumer": body.get("consumer"), "cursor": cursor}, False
+
     def _op_prune_preview(self, body, connection):
-        return self.store.prune_preview(before=body.get("before"), keep_last=body.get("keep_last")), False
+        result = self.store.prune_preview(
+            before=body.get("before"), keep_last=body.get("keep_last")
+        )
+        minimum_acked = self.cursors.minimum_acked_seq()
+        result["minimum_acked_seq"] = minimum_acked
+        result["cursor_blocked"] = (
+            minimum_acked is not None and int(result["cutoff_seq"]) > minimum_acked
+        )
+        return result, False
 
     # ------------------------------------------------------------ subscribe ops
 
     def _op_subscribe(self, body, connection):
         filters = normalize_filters(body.get("filters", body.get("filter")))
         replay = int(body.get("replay", 0) or 0)
-        with self._connections_lock:
-            sub_id = self._next_subscription_id
-            self._next_subscription_id += 1
-            connection.subscriptions[sub_id] = filters
-        result: dict[str, Any] = {"sub": sub_id, "filters": filters}
-        if replay:
-            history = self.store.query(
-                kind=filters.get("kind"),
-                topic=filters.get("topic"),
-                producer=filters.get("producer"),
-                state=filters.get("state"),
-                correlation_id=filters.get("correlation_id"),
-                since_seq=filters.get("since_seq"),
-                limit=max(1, min(replay, 5000)),
-                order="desc",
-            )
-            for event in reversed(history):
-                connection.enqueue_push(make_push("event", sub=sub_id, event=event))
-            result["replayed"] = len(history)
+        # Serialize registration with appends. A write committed immediately
+        # before registration may still broadcast afterward, so the returned
+        # boundary lets the client suppress that pre-subscription event.
+        with self._write_lock:
+            start_seq = self.store.last_seq()
+            with self._connections_lock:
+                sub_id = self._next_subscription_id
+                self._next_subscription_id += 1
+                connection.subscriptions[sub_id] = filters
+            result: dict[str, Any] = {
+                "sub": sub_id,
+                "filters": filters,
+                "start_seq": start_seq,
+            }
+            if replay:
+                history = self.store.query(
+                    kind=filters.get("kind"),
+                    topic=filters.get("topic"),
+                    producer=filters.get("producer"),
+                    state=filters.get("state"),
+                    correlation_id=filters.get("correlation_id"),
+                    since_seq=filters.get("since_seq"),
+                    until_seq=start_seq,
+                    limit=max(1, min(replay, 5000)),
+                    order="desc",
+                )
+                for event in reversed(history):
+                    connection.enqueue_push(make_push("event", sub=sub_id, event=event))
+                result["replayed"] = len(history)
         return result, False
 
     def _op_unsubscribe(self, body, connection):
@@ -788,6 +855,7 @@ class QuayServer:
             "payload": body.get("payload"),
             "kind": body.get("kind", "generic"),
             "causation_id": body.get("causation_id"),
+            "root_causation_id": body.get("root_causation_id"),
             "correlation_id": body.get("correlation_id"),
         }
         written = self._emit_locked([event])
@@ -824,6 +892,7 @@ class QuayServer:
                     "payload": item.get("payload"),
                     "kind": item.get("kind", "generic"),
                     "causation_id": item.get("causation_id"),
+                    "root_causation_id": item.get("root_causation_id"),
                     "correlation_id": item.get("correlation_id"),
                     "ts": item.get("ts"),
                 }
@@ -839,7 +908,7 @@ class QuayServer:
             "executor": body.get("executor"),
             "state": state,
         }
-        for optional in ("title", "lease_seconds", "evidence", "reason"):
+        for optional in ("title", "lease_seconds", "evidence", "reason", "fencing_token"):
             if optional in body and body[optional] is not None:
                 payload[optional] = body[optional]
         return {
@@ -848,6 +917,7 @@ class QuayServer:
             "payload": payload,
             "kind": "work",
             "causation_id": body.get("causation_id"),
+            "root_causation_id": body.get("root_causation_id"),
             "correlation_id": body.get("correlation_id"),
         }
 
@@ -880,6 +950,19 @@ class QuayServer:
     def _op_prune(self, body, connection):
         dry_run = bool(body.get("dry_run", False))
         with self._write_lock:
+            plan = self.store.prune_preview(
+                before=body.get("before"), keep_last=body.get("keep_last")
+            )
+            minimum_acked = self.cursors.minimum_acked_seq()
+            if minimum_acked is not None and int(plan["cutoff_seq"]) > minimum_acked:
+                raise StoreError(
+                    "cursor_prune_conflict",
+                    "prune would delete events not acknowledged by every durable consumer",
+                    {
+                        "cutoff_seq": plan["cutoff_seq"],
+                        "minimum_acked_seq": minimum_acked,
+                    },
+                )
             result = self.store.prune(
                 before=body.get("before"), keep_last=body.get("keep_last"), dry_run=dry_run
             )

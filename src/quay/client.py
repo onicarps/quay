@@ -219,9 +219,15 @@ class SubscriptionStream:
         self.queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=queue_size)
         self.dropped = 0
         self.lagged_notices = 0
+        self.recovered_events = 0
+        self._last_received_seq = 0
         self._sock: socket.socket | None = None
         self._reader: threading.Thread | None = None
         self._closed = threading.Event()
+        self._terminal = threading.Event()
+        self._terminal_lock = threading.Lock()
+        self._terminal_notice: dict[str, Any] | None = None
+        self._terminal_notice_delivered = False
         self.sub_id: int | None = None
         self.replayed = 0
 
@@ -246,7 +252,13 @@ class SubscriptionStream:
         # Replayed events arrive before the subscribe response; queue them in
         # order before the reader thread starts so none are lost or reordered.
         for frame in early:
-            self._put(frame)
+            self._put_event_frame(frame)
+        # The server captures this boundary atomically when it registers the
+        # subscription. Advancing to it after queuing replay frames prevents a
+        # replay-0 recovery from backfilling pre-subscription history.
+        self._last_received_seq = max(
+            self._last_received_seq, int(result.get("start_seq", 0))
+        )
         self._sock.settimeout(None)
         self._reader = threading.Thread(target=self._read_loop, name="quay-sub", daemon=True)
         self._reader.start()
@@ -268,6 +280,7 @@ class SubscriptionStream:
 
     def _read_loop(self) -> None:
         assert self._sock is not None
+        terminal_notice: dict[str, Any] | None = None
         try:
             while not self._closed.is_set():
                 try:
@@ -280,13 +293,79 @@ class SubscriptionStream:
                 if frame_type == "lagged":
                     self.lagged_notices += 1
                     self.dropped += int(frame.get("dropped", 0))
+                    try:
+                        self._recover_gap(int(frame.get("last_seq") or 0))
+                    except ClientError as exc:
+                        terminal_notice = {
+                            "type": "recovery_error",
+                            "error": exc.to_dict(),
+                            "last_seq": frame.get("last_seq"),
+                        }
+                        return
                 if frame_type == "shutdown":
                     self._put({"type": "shutdown", "reason": frame.get("reason")})
                     return
-                if not self._put(frame):
+                if not self._put_event_frame(frame):
                     return
         finally:
-            self._put(None)
+            self._finish(terminal_notice)
+
+    def _put_event_frame(self, frame: dict[str, Any]) -> bool:
+        """Queue one frame, suppressing replay/live duplicates by sequence."""
+        if frame.get("type") != "event":
+            return self._put(frame)
+        event = frame.get("event")
+        if not isinstance(event, Mapping):
+            return self._put(frame)
+        seq = int(event.get("seq") or 0)
+        if seq > 0 and seq <= self._last_received_seq:
+            return True
+        if not self._put(frame):
+            return False
+        if seq > 0:
+            self._last_received_seq = seq
+        return True
+
+    def _recover_gap(self, until_seq: int) -> None:
+        """Backfill matching events dropped by the server before live resumes."""
+        if until_seq <= self._last_received_seq:
+            return
+        cursor = self._last_received_seq
+        while cursor < until_seq:
+            query = dict(self.filters)
+            configured_since = query.get("since_seq")
+            lower_bound = int(configured_since) if configured_since is not None else 1
+            query["since_seq"] = max(lower_bound, cursor + 1)
+            query["until_seq"] = until_seq
+            query["limit"] = 5000
+            query["order"] = "asc"
+            with QuayClient(self.socket_path, timeout=self.timeout) as client:
+                events = client.query(**query)
+            if not events:
+                self._last_received_seq = until_seq
+                return
+            previous = cursor
+            for event in events:
+                seq = int(event.get("seq") or 0)
+                if seq <= cursor:
+                    continue
+                if not self._put_event_frame({"type": "event", "event": event, "recovered": True}):
+                    raise ClientError(
+                        "recovery_queue_full",
+                        "subscription queue filled while backfilling a lagged stream",
+                        {"cursor": cursor, "until_seq": until_seq},
+                    )
+                self.recovered_events += 1
+                cursor = seq
+            if cursor <= previous:
+                raise ClientError(
+                    "recovery_stalled",
+                    "gap recovery made no sequence progress",
+                    {"cursor": cursor, "until_seq": until_seq},
+                )
+            if len(events) < 5000:
+                self._last_received_seq = max(self._last_received_seq, until_seq)
+                return
 
     def _put(self, frame: dict[str, Any] | None) -> bool:
         try:
@@ -295,16 +374,41 @@ class SubscriptionStream:
         except queue.Full:
             return False
 
-    def close(self) -> None:
-        if self._closed.is_set():
-            return
-        self._closed.set()
+    def _finish(self, notice: dict[str, Any] | None = None) -> None:
+        """Record terminal state even when the bounded queue has no free slot."""
+        with self._terminal_lock:
+            if notice is not None and self._terminal_notice is None:
+                self._terminal_notice = notice
+            already_terminal = self._terminal.is_set()
+            self._terminal.set()
+            self._closed.set()
         if self._sock is not None:
             with contextlib.suppress(OSError):
                 self._sock.shutdown(socket.SHUT_RDWR)
             with contextlib.suppress(OSError):
                 self._sock.close()
-        self._put(None)
+        if not already_terminal or notice is not None:
+            # Wake a consumer already blocked on an empty queue.  If the queue
+            # is full, poll() observes terminal state after draining it.
+            self._put(None)
+
+    def _terminal_after_drain(self) -> dict[str, Any] | None:
+        """Return a terminal notice once; subsequent calls report end-of-stream."""
+        with self._terminal_lock:
+            if self._terminal_notice is not None and not self._terminal_notice_delivered:
+                self._terminal_notice_delivered = True
+                return self._terminal_notice
+        return None
+
+    @property
+    def is_terminal(self) -> bool:
+        """Return whether the stream has ended and will receive no more frames."""
+        return self._terminal.is_set()
+
+    def close(self) -> None:
+        if self._terminal.is_set():
+            return
+        self._finish()
 
     def __enter__(self) -> "SubscriptionStream":
         return self.open()
@@ -314,10 +418,36 @@ class SubscriptionStream:
 
     def poll(self, timeout: float | None = 1.0) -> dict[str, Any] | None:
         """Return the next raw frame, or None on timeout/end of stream."""
+        if self._terminal.is_set() and self.queue.empty():
+            notice = self._terminal_after_drain()
+            if notice is not None:
+                return notice
+            if timeout is None:
+                return None
+            # A terminal marker has already been consumed. Respect the
+            # caller's timeout instead of returning immediately on every poll,
+            # which would turn retry loops into a CPU busy-spin.
         try:
-            return self.queue.get(timeout=timeout)
+            frame = self.queue.get(timeout=timeout)
         except queue.Empty:
+            if self._terminal.is_set():
+                return self._terminal_after_drain()
             return None
+        if frame is None and self._terminal.is_set():
+            return self._terminal_after_drain()
+        return frame
+
+    @staticmethod
+    def _raise_recovery_error(frame: Mapping[str, Any]) -> None:
+        """Raise the original recovery failure carried by a terminal frame."""
+        if frame.get("type") != "recovery_error":
+            return
+        error = frame.get("error") or {}
+        raise ClientError(
+            str(error.get("code", "recovery_failed")),
+            str(error.get("message", "subscription gap recovery failed")),
+            error.get("detail") if isinstance(error.get("detail"), Mapping) else {},
+        )
 
     def frames(self, timeout: float | None = 5.0) -> Iterator[dict[str, Any]]:
         """Yield raw push frames until the stream ends.
@@ -347,6 +477,8 @@ class SubscriptionStream:
                 return
             if frame.get("type") == "event":
                 yield frame["event"]
+            else:
+                self._raise_recovery_error(frame)
 
     def drain_until_lagged(self, *, timeout: float = 10.0) -> int:
         """Read frames until a lag notice arrives; return the total dropped."""
@@ -375,6 +507,8 @@ class SubscriptionStream:
                 raise ClientError("stream_closed", "the subscription stream ended")
             if frame.get("type") == "event":
                 collected.append(frame["event"])
+            else:
+                self._raise_recovery_error(frame)
         return collected
 
 

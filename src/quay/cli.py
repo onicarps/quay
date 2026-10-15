@@ -20,17 +20,17 @@ import csv
 import io
 import json
 import os
-import shutil
+import socket
 import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from . import PROTOCOL_VERSION, __version__
+from . import __version__
 from .client import ClientError, QuayClient, SubscriptionStream
 from .daemon import all_daemon_status, daemon_health, ensure_daemon, stop_daemon
 from .onboarding import onboard
-from .store import StoreError, utc_now
+from .store import StoreError
 from .tui import TuiApp
 from .workspace import (
     STATE_DIRECTORY,
@@ -191,6 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
     emit.add_argument("--kind", default="generic")
     emit.add_argument("--producer", default=None)
     emit.add_argument("--causation", type=int, default=None)
+    emit.add_argument("--root-causation", type=int, default=None)
     emit.add_argument("--correlation", default=None)
     emit.add_argument("--correlation-id", dest="correlation", default=None)
 
@@ -209,7 +210,10 @@ def build_parser() -> argparse.ArgumentParser:
         node.add_argument("--title", default=None)
         node.add_argument("--lease-seconds", type=int, default=None)
         node.add_argument("--causation", type=int, default=None)
+        node.add_argument("--root-causation", type=int, default=None)
         node.add_argument("--correlation", default=None)
+        if state != "claimed":
+            node.add_argument("--fencing-token", type=int, required=True)
         if state in ("done", "failed"):
             node.add_argument("--evidence", required=True, help="JSON object of proof")
         if state in ("abandoned", "expired"):
@@ -226,6 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--state", default=None)
     query.add_argument("--correlation", dest="correlation_id", default=None)
     query.add_argument("--causation", type=int, default=None)
+    query.add_argument("--root-causation", type=int, default=None)
     query.add_argument("--since-seq", type=int, default=None)
     query.add_argument("--until-seq", type=int, default=None)
     query.add_argument("--since", dest="since_ts", default=None, help="ISO timestamp lower bound")
@@ -426,12 +431,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     python_ok = sys.version_info >= (3, 11)
     checks.append({"check": "python>=3.11", "ok": python_ok, "detail": sys.version.split()[0]})
-    checks.append({"check": "unix-socket", "ok": hasattr(os, "getuid"), "detail": sys.platform})
+    checks.append({"check": "unix-socket", "ok": hasattr(socket, "AF_UNIX"), "detail": sys.platform})
 
     try:
         root = workspace_path(args)
         paths = paths_for(root)
         checks.append({"check": "workspace", "ok": True, "detail": str(root)})
+        checks.append(
+            {
+                "check": "workspace-resolution",
+                "ok": True,
+                "detail": {"requested": str(root), "shared_root": str(paths.workspace)},
+            }
+        )
     except WorkspaceError as exc:
         checks.append({"check": "workspace", "ok": False, "detail": str(exc)})
         emit_result({"checks": checks}, json_mode=json_mode)
@@ -474,6 +486,7 @@ def cmd_emit(args: argparse.Namespace) -> int:
         "payload": payload,
         "kind": args.kind,
         "causation_id": args.causation,
+        "root_causation_id": args.root_causation,
         "correlation_id": args.correlation,
     }
     with connected(args) as client:
@@ -521,6 +534,7 @@ def cmd_work(args: argparse.Namespace) -> int:
         "executor": args.executor,
         "topic": args.topic,
         "causation_id": args.causation,
+        "root_causation_id": args.root_causation,
         "correlation_id": args.correlation,
     }
     if args.title:
@@ -531,6 +545,8 @@ def cmd_work(args: argparse.Namespace) -> int:
         body["evidence"] = evidence
     if getattr(args, "reason", None):
         body["reason"] = args.reason
+    if getattr(args, "fencing_token", None) is not None:
+        body["fencing_token"] = args.fencing_token
     operation = {"claim": "work_claim", "heartbeat": "work_heartbeat", "complete": "work_complete", "abandon": "work_abandon"}[sub]
     with connected(args) as client:
         event = client.request(operation, body)["event"]
@@ -552,6 +568,7 @@ def _query_filters(args: argparse.Namespace) -> dict[str, Any]:
             "state": args.state,
             "correlation_id": args.correlation_id,
             "causation_id": args.causation,
+            "root_causation_id": args.root_causation,
             "since_seq": args.since_seq,
             "until_seq": args.until_seq,
             "since_ts": args.since_ts,
@@ -580,7 +597,20 @@ def cmd_query(args: argparse.Namespace) -> int:
     if args.export == "csv":
         buffer = io.StringIO()
         writer = csv.writer(buffer)
-        writer.writerow(["seq", "ts", "kind", "topic", "producer", "causation_id", "correlation_id", "hash", "payload"])
+        writer.writerow(
+            [
+                "seq",
+                "ts",
+                "kind",
+                "topic",
+                "producer",
+                "causation_id",
+                "root_causation_id",
+                "correlation_id",
+                "hash",
+                "payload",
+            ]
+        )
         for event in events:
             writer.writerow(
                 [
@@ -590,6 +620,9 @@ def cmd_query(args: argparse.Namespace) -> int:
                     event["topic"],
                     event["producer"],
                     event["causation_id"] if event["causation_id"] is not None else "",
+                    event.get("root_causation_id")
+                    if event.get("root_causation_id") is not None
+                    else "",
                     event["correlation_id"] or "",
                     event["hash"],
                     json.dumps(event["payload"], sort_keys=True, ensure_ascii=False),
@@ -664,8 +697,11 @@ def _follow(args: argparse.Namespace, *, json_mode: bool, initial_limit: int) ->
                     break
                 frame = live.poll(0.2)
                 if frame is None:
+                    if live.is_terminal:
+                        break
                     continue
                 if frame.get("type") != "event":
+                    SubscriptionStream._raise_recovery_error(frame)
                     continue
                 _print_event_lines([frame["event"]], json_mode=json_mode)
                 delivered += 1
@@ -691,7 +727,21 @@ def cmd_watch(args: argparse.Namespace) -> int:
         paths = onboard(root, idle_seconds=getattr(args, "idle_seconds", None)).paths
     else:
         paths, _health = ensure_daemon(root, idle_seconds=getattr(args, "idle_seconds", None))
-    interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.plain
+    terminal_is_dumb = os.environ.get("TERM", "").lower() == "dumb"
+    monitor_plain_fallback = getattr(args, "command", None) == "monitor" and (
+        not sys.stdout.isatty() or terminal_is_dumb
+    )
+    plain = bool(args.plain or monitor_plain_fallback)
+    if monitor_plain_fallback and not args.plain:
+        sys.stderr.write(
+            "quay: monitor has no interactive terminal; streaming JSON lines in plain mode\n"
+        )
+    interactive = (
+        sys.stdin.isatty()
+        and sys.stdout.isatty()
+        and not terminal_is_dumb
+        and not plain
+    )
     if interactive:
         app = TuiApp(
             paths.socket,
@@ -701,7 +751,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         )
         return app.run()
 
-    if not args.plain:
+    if not plain:
         # No TTY and no explicit --plain: print a snapshot instead of
         # streaming forever, which is what a script or CI job wants.
         sys.stderr.write("quay: no TTY; printing a status snapshot instead of the cockpit\n")
