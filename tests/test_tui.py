@@ -32,6 +32,7 @@ from quay.tui import (
     sanitize,
     summarize_event,
     terminal_session,
+    split_keys,
 )
 
 
@@ -524,6 +525,136 @@ class TestTuiApp:
         app = TuiApp("/tmp/x.sock")
         assert app.handle_key("", FakeClient()) is True
         assert app.filter_index == 0
+
+    def test_arrow_and_page_keys_navigate(self):
+        app = TuiApp("/tmp/x.sock", history=10)
+        app.events = [sample_event(seq=n) for n in range(10)]
+        app.stream_rows = 5
+        client = FakeClient()
+
+        # Down arrow ANSI and SS3
+        app.handle_key("\x1b[B", client)
+        assert app.selection == 1
+        app.handle_key("\x1bOB", client)
+        assert app.selection == 2
+
+        # Up arrow ANSI and SS3
+        app.handle_key("\x1b[A", client)
+        assert app.selection == 1
+        app.handle_key("\x1bOA", client)
+        assert app.selection == 0
+
+        # Page Down and Page Up
+        app.handle_key("\x1b[6~", client)
+        assert app.selection == 3
+        app.handle_key("\x1b[5~", client)
+        assert app.selection == 0
+
+        # End and Home
+        app.handle_key("\x1b[F", client)
+        assert app.selection == 9
+        app.handle_key("\x1b[H", client)
+        assert app.selection == 0
+
+    def test_viewport_scrolling_tracks_selection(self):
+        app = TuiApp("/tmp/x.sock", history=30)
+        app.events = [sample_event(seq=n) for n in range(30)]
+        app.stream_rows = 5
+        client = FakeClient()
+
+        # Selection within viewport: offset remains 0
+        for _ in range(4):
+            app.handle_key("\x1b[B", client)
+        assert app.selection == 4
+        assert app.scroll_offset == 0
+
+        # Moving past viewport bottom advances scroll_offset
+        app.handle_key("\x1b[B", client)
+        assert app.selection == 5
+        assert app.scroll_offset == 1
+
+        # Moving to end
+        app.handle_key("\x1b[F", client)
+        assert app.selection == 29
+        assert app.scroll_offset == 25  # 30 - 5
+
+        # Moving to top
+        app.handle_key("\x1b[H", client)
+        assert app.selection == 0
+        assert app.scroll_offset == 0
+
+    def test_sgr_mouse_click_and_scroll(self):
+        app = TuiApp("/tmp/x.sock", history=10)
+        app.events = [sample_event(seq=n) for n in range(10)]
+        app.stream_rows = 5
+        app.last_width = 80
+        app.last_height = 24
+        client = FakeClient()
+
+        # Left click on row 5 (body_top is 3, so offset is 2 -> selection index 2)
+        # SGR format: \x1b[<b;x;y;M (1-indexed x=15, y=5 -> 0-indexed row=4, offset=1)
+        app.handle_key("\x1b[<0;15;5M", client)
+        assert app.selection == 1
+
+        # Left click release is ignored
+        app.handle_key("\x1b[<0;15;5m", client)
+        assert app.selection == 1
+
+        # Mouse wheel down (b=65)
+        app.handle_key("\x1b[<65;15;5M", client)
+        assert app.selection == 2
+
+        # Mouse wheel up (b=64)
+        app.handle_key("\x1b[<64;15;5M", client)
+        assert app.selection == 1
+
+        # Left click on filter row (row=2, 1-indexed -> 0-indexed row 1)
+        assert app.filter_index == 0
+        app.handle_key("\x1b[<0;10;2M", client)
+        assert app.filter_index == 1
+
+        # Left click near PAUSED (row=1, 1-indexed, col=60)
+        assert app.paused is False
+        app.handle_key("\x1b[<0;60;1M", client)
+        assert app.paused is True
+
+    def test_inspect_overlay_toggle_and_dismiss(self):
+        app = TuiApp("/tmp/x.sock", history=5)
+        app.events = [sample_event(seq=42, summary="critical issue")]
+        client = FakeClient()
+
+        # Enter toggles inspect
+        app.handle_key("\r", client)
+        assert app.inspecting is True
+
+        # Esc dismisses inspect
+        app.handle_key("\x1b", client)
+        assert app.inspecting is False
+
+        # Enter again, 'q' dismisses inspect without exiting app
+        app.handle_key("\n", client)
+        assert app.inspecting is True
+        res = app.handle_key("q", client)
+        assert res is True
+        assert app.inspecting is False
+
+    def test_split_keys_parser(self):
+        # Concatenated mouse press and release
+        events = split_keys("\x1b[<0;20;5M\x1b[<0;20;5m")
+        assert events == ["\x1b[<0;20;5M", "\x1b[<0;20;5m"]
+
+        # Concatenated arrow keys
+        arrows = split_keys("\x1b[A\x1b[B\x1bOA")
+        assert arrows == ["\x1b[A", "\x1b[B", "\x1bOA"]
+
+        # Page and function keys
+        pages = split_keys("\x1b[5~\x1b[6~")
+        assert pages == ["\x1b[5~", "\x1b[6~"]
+
+        # Plain text characters and standalone Esc
+        plain = split_keys("jk\x1b?")
+        assert plain == ["j", "k", "\x1b", "?"]
+
 
     def test_detail_toggle(self):
         app = TuiApp("/tmp/x.sock")

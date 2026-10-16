@@ -24,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import re
 import select
 import shutil
 import signal
@@ -247,7 +248,11 @@ def _event_seq(event: Mapping[str, Any]) -> int:
 
 HELP_LINES = (
     "  q / Ctrl-C   detach (the daemon keeps running)",
-    "  ↑ / ↓, k / j move the selection",
+    "  ↑ / ↓, k / j move the selection cursor",
+    "  mouse click  select event / cycle filter",
+    "  mouse wheel  scroll events up / down",
+    "  Enter        inspect full event payload",
+    "  PgUp / PgDn  scroll by page",
     "  g / G        jump to oldest / newest",
     "  space        pause or resume live updates",
     "  f            cycle the kind filter",
@@ -271,7 +276,19 @@ SAMPLE_PRODUCER = "quay"
 
 #: Kept under 100 columns so the tail stays visible on a narrow terminal; the
 #: help overlay lists the full set of keys, including the detail toggle.
-HINT_LINE = " q detach  ↑↓ move  space pause  f filter  1-6  s sample  v verify  b reap  ctrl-l refresh  ? help"
+HINT_LINE = " q detach  ↑↓/click move  enter inspect  space pause  f filter  s sample  v verify  ctrl-l refresh  ? help"
+
+_KEY_SPLIT_PATTERN = re.compile(
+    r"(\x1b\[<[0-9]+;[0-9]+;[0-9]+[Mm]|\x1b\[[0-9;?]*[A-Za-z~]|\x1bO[A-Za-z]|\x1b|.)",
+    re.DOTALL,
+)
+
+
+def split_keys(raw: str) -> list[str]:
+    """Split a raw input buffer into individual keys and mouse events."""
+    if not raw:
+        return []
+    return _KEY_SPLIT_PATTERN.findall(raw)
 
 
 class Dashboard:
@@ -298,20 +315,67 @@ class Dashboard:
         stream_rows = max(0, body_bottom - body_top + 1)
         show_side = bool(model.get("detail", self.detail)) and width >= 72
         stream_width = width - 34 if show_side else width
-        self._columns(screen, body_top - 1, stream_width)
-        self._stream(screen, body_top, stream_rows, stream_width, events, selection, model)
+
+        scroll_offset = int(model.get("scroll_offset", 0))
+        if scroll_offset <= 0 and selection >= stream_rows and stream_rows > 0:
+            scroll_offset = min(selection - stream_rows + 1, max(0, len(events) - stream_rows))
+        scroll_offset = max(0, min(scroll_offset, max(0, len(events) - stream_rows)))
+
+        scroll_info = ""
+        if len(events) > stream_rows and stream_rows > 0:
+            start = scroll_offset + 1
+            end = min(scroll_offset + stream_rows, len(events))
+            scroll_info = f"[{start}-{end}/{len(events)}]"
+
+        self._columns(screen, body_top - 1, stream_width, scroll_info)
+        self._stream(screen, body_top, stream_rows, stream_width, events, selection, model, scroll_offset)
         if show_side:
-            self._planes(screen, body_top, stream_rows, width - 34, status)
+            self._planes(screen, body_top, stream_rows, width - 34, status, events, selection)
         self._footer(screen, height - 2, model, status)
         # The overlay is drawn last so the body cannot paint over it; its box
         # never reaches the footer row, so the verify banner stays visible.
         if model.get("help"):
             self._overlay(screen, "keys", HELP_LINES)
+        elif model.get("inspecting") and 0 <= selection < len(events):
+            self._render_inspect(screen, events[selection])
         return screen
 
-    def _columns(self, screen: Screen, row: int, width: int) -> None:
+    def _columns(self, screen: Screen, row: int, width: int, scroll_info: str = "") -> None:
         if 0 <= row < screen.height:
-            screen.put(row, 0, _shorten(" age   seq  kind     topic                  producer   summary", width), "border")
+            header_text = " age   seq  kind     topic                  producer   summary"
+            if scroll_info:
+                header_text = f"{header_text:<60s} {scroll_info}"
+            screen.put(row, 0, _shorten(header_text, width), "border")
+
+    def _render_inspect(self, screen: Screen, event: Mapping[str, Any]) -> None:
+        import json
+
+        seq = event.get("seq", "?")
+        kind = event.get("kind", "?")
+        topic = event.get("topic", "")
+        producer = event.get("producer", "")
+        ts = event.get("ts", "")
+        causation = event.get("causation_id")
+        root_causation = event.get("root_causation_id")
+        h = event.get("hash", "")
+        lines = [
+            f"Seq: #{seq}  Kind: {kind}  Producer: {producer}",
+            f"Topic: {topic}",
+            f"Timestamp: {ts}",
+            f"Causation: #{causation}  Root: #{root_causation}" if causation else f"Root: #{root_causation}",
+            f"Hash: {h}",
+            "Payload:",
+        ]
+        payload = event.get("payload")
+        try:
+            payload_json = json.dumps(payload, indent=2, ensure_ascii=False)
+            for pl_line in payload_json.splitlines()[:14]:
+                lines.append(f"  {pl_line}")
+        except Exception:
+            lines.append(f"  {payload}")
+        lines.append("")
+        lines.append("Press Enter or Esc to dismiss")
+        self._overlay(screen, f"inspect event #{seq}", lines)
 
     # ------------------------------------------------------------------ pieces
 
@@ -343,6 +407,7 @@ class Dashboard:
         events: Sequence[Mapping[str, Any]],
         selection: int,
         model: Mapping[str, Any],
+        scroll_offset: int = 0,
     ) -> None:
         if rows <= 0:
             return
@@ -352,10 +417,11 @@ class Dashboard:
         if not events:
             screen.put(top, 1, "waiting for events…", "dim")
             return
-        visible = events[:rows]
-        for index, event in enumerate(visible):
-            row = top + index
-            selected = index == selection
+        visible = events[scroll_offset : scroll_offset + rows]
+        for offset, event in enumerate(visible):
+            row = top + offset
+            actual_index = scroll_offset + offset
+            selected = actual_index == selection
             style = "selected" if selected else KIND_STYLE.get(str(event.get("kind")), "default")
             seq = event.get("seq", "?")
             kind = str(event.get("kind", "?"))
@@ -366,7 +432,16 @@ class Dashboard:
             line = prefix + summarize_event(event, max(8, width - len(prefix) - 2))
             screen.put(row, 0, _shorten(line, width), style)
 
-    def _planes(self, screen: Screen, top: int, rows: int, col: int, status: Mapping[str, Any]) -> None:
+    def _planes(
+        self,
+        screen: Screen,
+        top: int,
+        rows: int,
+        col: int,
+        status: Mapping[str, Any],
+        events: Sequence[Mapping[str, Any]] = (),
+        selection: int = -1,
+    ) -> None:
         planes = status.get("planes", {}) if isinstance(status, Mapping) else {}
         signal = planes.get("signal", {}) if isinstance(planes, Mapping) else {}
         work = planes.get("work", {}) if isinstance(planes, Mapping) else {}
@@ -406,6 +481,39 @@ class Dashboard:
             screen.put(cursor, col + 2, f"chain: {chain}", style)
             cursor += 1
             screen.put(cursor, col + 2, f"verified seq: {integrity.get('verified_seq', 0)}", "dim")
+            cursor += 1
+
+        if 0 <= selection < len(events) and cursor < top + rows - 2:
+            sel_event = events[selection]
+            cursor += 1
+            if cursor < top + rows:
+                screen.put(cursor, col + 2, " selected event", "bold")
+                cursor += 1
+            seq = sel_event.get("seq", "?")
+            kind = str(sel_event.get("kind", "?"))
+            if cursor < top + rows:
+                screen.put(cursor, col + 2, f"#{seq} ({kind})", KIND_STYLE.get(kind, "title"))
+                cursor += 1
+            if cursor < top + rows:
+                topic = str(sel_event.get("topic", ""))
+                screen.put(cursor, col + 2, _shorten(f"topic: {topic}", 30), "default")
+                cursor += 1
+            if cursor < top + rows:
+                producer = str(sel_event.get("producer", ""))
+                screen.put(cursor, col + 2, _shorten(f"from: {producer}", 30), "dim")
+                cursor += 1
+            if cursor < top + rows:
+                causation = sel_event.get("causation_id")
+                if causation:
+                    screen.put(cursor, col + 2, f"cause: #{causation}", "dim")
+                    cursor += 1
+            if cursor < top + rows:
+                payload = sel_event.get("payload")
+                if isinstance(payload, Mapping):
+                    summary = payload.get("summary") or payload.get("text") or payload.get("name")
+                    if summary:
+                        screen.put(cursor, col + 2, _shorten(f"info: {summary}", 30), "accent")
+                        cursor += 1
 
     def _footer(self, screen: Screen, row: int, model: Mapping[str, Any], status: Mapping[str, Any]) -> None:
         if row < 0 or row >= screen.height:
@@ -459,6 +567,11 @@ class TuiApp:
         self.refresh_seconds = refresh_seconds
         self.dashboard = Dashboard()
         self.selection = 0
+        self.scroll_offset = 0
+        self.inspecting = False
+        self.stream_rows = 20
+        self.last_width = 80
+        self.last_height = 24
         self.paused = False
         self.help = False
         self.message = ""
@@ -486,9 +599,11 @@ class TuiApp:
             "workspace": self.workspace,
             "events": self.events,
             "selection": self.selection,
+            "scroll_offset": self.scroll_offset,
             "filter_label": self.filter_label,
             "paused": self.paused,
             "help": self.help,
+            "inspecting": self.inspecting,
             "message": self.message,
             "verify_banner": self.verify_banner,
             "dropped": self.dropped,
@@ -523,6 +638,7 @@ class TuiApp:
         self.events = [dict(event) for event in events]
         self.events.sort(key=_event_seq, reverse=True)
         self.selection = 0
+        self.scroll_offset = 0
 
     # ------------------------------------------------------------------ redraw
 
@@ -542,20 +658,81 @@ class TuiApp:
         self.redraw_requested = False
         return True
 
+    def ensure_selection_visible(self) -> None:
+        """Keep the selected row within the visible viewport."""
+        rows = self.stream_rows
+        if rows <= 0 or not self.events:
+            self.scroll_offset = 0
+            return
+        max_offset = max(0, len(self.events) - rows)
+        if self.selection < self.scroll_offset:
+            self.scroll_offset = max(0, min(self.selection, max_offset))
+        elif self.selection >= self.scroll_offset + rows:
+            self.scroll_offset = max(0, min(self.selection - rows + 1, max_offset))
+
     def handle_key(self, key: str, client) -> bool:
-        """Apply one key press. Returns False when the UI should exit."""
+        """Apply one key press or mouse event. Returns False when the UI should exit."""
+        if not key:
+            return True
         if key in ("q", "\x03"):
+            if self.inspecting or self.help:
+                self.inspecting = False
+                self.help = False
+                self.request_redraw()
+                return True
             return False
+
+        if key == "\x1b":
+            if self.inspecting or self.help:
+                self.inspecting = False
+                self.help = False
+                self.request_redraw()
+            return True
+
+        if key in ("\r", "\n"):
+            if self.inspecting:
+                self.inspecting = False
+            elif self.events and 0 <= self.selection < len(self.events):
+                self.inspecting = True
+            self.request_redraw()
+            return True
+
         if key == "?":
             self.help = not self.help
-        elif key in ("\x1b[B", "j") and self.events:
+            if self.help:
+                self.inspecting = False
+            self.request_redraw()
+            return True
+
+        # SGR Mouse event: \x1b[<b;x;y;M or \x1b[<b;x;y;m
+        if key.startswith("\x1b[<") and (key.endswith("M") or key.endswith("m")):
+            self._handle_mouse(key, client)
+            return True
+
+        # Dismiss overlays on any navigation key
+        if self.help or self.inspecting:
+            self.help = False
+            self.inspecting = False
+            self.request_redraw()
+
+        if key in ("\x1b[B", "\x1bOB", "j") and self.events:
             self.selection = min(self.selection + 1, len(self.events) - 1)
-        elif key in ("\x1b[A", "k"):
+            self.ensure_selection_visible()
+        elif key in ("\x1b[A", "\x1bOA", "k"):
             self.selection = max(0, self.selection - 1)
-        elif key == "g":
+            self.ensure_selection_visible()
+        elif key == "\x1b[5~":  # Page Up
+            self.selection = max(0, self.selection - max(1, self.stream_rows - 2))
+            self.ensure_selection_visible()
+        elif key == "\x1b[6~":  # Page Down
+            self.selection = min(len(self.events) - 1, self.selection + max(1, self.stream_rows - 2))
+            self.ensure_selection_visible()
+        elif key in ("g", "\x1b[F", "\x1b[4~", "\x1bOF"):
             self.selection = max(0, len(self.events) - 1)
-        elif key == "G":
+            self.ensure_selection_visible()
+        elif key in ("G", "\x1b[H", "\x1b[1~", "\x1bOH"):
             self.selection = 0
+            self.ensure_selection_visible()
         elif key == " ":
             self.paused = not self.paused
             self.message = "paused" if self.paused else ""
@@ -577,6 +754,58 @@ class TuiApp:
             # Ctrl-L: repaint only. No model change, no ledger event.
             self.request_redraw()
         return True
+
+    def _handle_mouse(self, key: str, client) -> None:
+        if self.help or self.inspecting:
+            self.help = False
+            self.inspecting = False
+            self.request_redraw()
+            return
+
+        body = key[3:-1]
+        parts = body.split(";")
+        if len(parts) != 3:
+            return
+        try:
+            b = int(parts[0])
+            col = int(parts[1]) - 1
+            row = int(parts[2]) - 1
+        except ValueError:
+            return
+
+        is_release = key.endswith("m")
+
+        if b == 64:  # Wheel up
+            if self.events:
+                self.selection = max(0, self.selection - 1)
+                self.ensure_selection_visible()
+                self.request_redraw()
+            return
+        elif b == 65:  # Wheel down
+            if self.events:
+                self.selection = min(len(self.events) - 1, self.selection + 1)
+                self.ensure_selection_visible()
+                self.request_redraw()
+            return
+        elif b == 0 and not is_release:  # Left button click
+            body_top = 3
+            if body_top <= row < body_top + self.stream_rows and self.events:
+                offset = row - body_top
+                target = self.scroll_offset + offset
+                if 0 <= target < len(self.events):
+                    self.selection = target
+                    self.ensure_selection_visible()
+                    self.request_redraw()
+            elif row == 1:
+                # Clicked on filter bar
+                self.filter_index = (self.filter_index + 1) % len(FILTER_PRESETS)
+                self.reload_history(client)
+                self.request_redraw()
+            elif row == 0 and col >= max(0, self.last_width - 30):
+                # Clicked near PAUSED
+                self.paused = not self.paused
+                self.message = "paused" if self.paused else ""
+                self.request_redraw()
 
     def run_sample(self, client) -> None:
         """Inject one schema-valid demo event so the planes visibly move."""
@@ -655,6 +884,10 @@ class TuiApp:
         factory = reader_factory or terminal_session
         get_size = size_getter or shutil.get_terminal_size
         size = get_size(fallback=(100, 30))
+        self.last_width = size.columns
+        self.last_height = size.lines
+        body_bottom = max(2, size.lines - 3)
+        self.stream_rows = max(0, body_bottom - 3 + 1)
         # The geometry is tracked separately from ``previous``: the cell cache
         # only describes frames we drew, while the terminal may have cleared or
         # reflowed the screen behind our back.
@@ -665,11 +898,15 @@ class TuiApp:
         stream_ended = False
         with factory(on_resize=self.request_redraw) as reader:
             write = stream.write
-            write(f"\x1b[?1049h{CLEAR_SCREEN}\x1b[?25l")
+            write(f"\x1b[?1049h{CLEAR_SCREEN}\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h")
             try:
                 while True:
                     size = get_size(fallback=size)
                     geometry = (size.columns, size.lines)
+                    self.last_width = size.columns
+                    self.last_height = size.lines
+                    body_bottom = max(2, size.lines - 3)
+                    self.stream_rows = max(0, body_bottom - 3 + 1)
                     # Always consume the request: a resize and SIGWINCH often
                     # arrive together, and a lingering flag would repaint twice.
                     redraw_requested = self.take_redraw_request()
@@ -729,17 +966,25 @@ class TuiApp:
                     key = reader(0.1)
                     if key is None:
                         continue
-                    # Escape sequences arrive in one burst; read the tail too.
-                    if key == "\x1b":
-                        tail = reader(0.01)
-                        if tail:
+                    # Escape sequences arrive in one burst; read the tail too if incomplete.
+                    if key == "\x1b" or (
+                        key.startswith(("\x1b[", "\x1bO"))
+                        and not key.endswith(("A", "B", "C", "D", "H", "F", "~", "M", "m"))
+                    ):
+                        while True:
+                            tail = reader(0.02)
+                            if not tail:
+                                break
                             key += tail
-                    if not self.handle_key(key, client):
-                        return 0
+                            if key.endswith(("A", "B", "C", "D", "H", "F", "~", "M", "m")):
+                                break
+                    for token in split_keys(key):
+                        if not self.handle_key(token, client):
+                            return 0
             except KeyboardInterrupt:
                 return 0
             finally:
-                write("\x1b[?25h\x1b[?1049l")
+                write("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l")
                 stream.flush()
 
 
@@ -810,9 +1055,15 @@ def terminal_session(*, on_resize=None):
         if not ready:
             return None
         try:
-            return sys.stdin.read(1)
+            raw = os.read(stdin, 1024)
+            if not raw:
+                return None
+            return raw.decode("utf-8", errors="replace")
         except (OSError, ValueError, io.UnsupportedOperation):
-            return None
+            try:
+                return sys.stdin.read(1)
+            except Exception:
+                return None
 
     try:
         yield read_key
