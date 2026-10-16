@@ -188,6 +188,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     distill.add_argument("--limit", type=int, default=100, help="maximum handoffs per run (1-1000)")
 
+    bridge = subparsers.add_parser(
+        "bridge", parents=[common], help="deliver one acknowledged wake at a time to a runner"
+    )
+    bridge.add_argument("--runner", required=True, help="named runner consumer")
+    bridge.add_argument("--poll-interval", type=float, default=1.0, help="poll interval in seconds")
+    bridge.add_argument("--max-retries", type=int, default=3, help="failures before dead-lettering")
+    bridge.add_argument("--wake-dir", default=None, help="wake spool directory")
+    bridge.add_argument("--ack-dir", default=None, help="companion acknowledgement directory")
+    bridge.add_argument(
+        "--ack-timeout", type=float, default=3600.0, help="seconds before an unacked wake is redelivered"
+    )
+    bridge.add_argument("--once", action="store_true", help="run one bridge cycle and exit")
+
     start = subparsers.add_parser("start", parents=[common], help="start the daemon for this workspace")
     start.add_argument("--idle-seconds", type=float, default=None, help="idle shutdown timeout (0 disables)")
 
@@ -359,6 +372,32 @@ def cmd_init(args: argparse.Namespace) -> int:
     if advisory:
         human += f"\n{advisory}"
     emit_result(result, json_mode=json_mode, human=human)
+    return EXIT_OK
+
+
+def cmd_bridge(args: argparse.Namespace) -> int:
+    from .bridge import WakeBridge
+
+    json_mode = _json_mode(args)
+    root = workspace_path(args)
+    ensure_daemon(root, idle_seconds=0)
+    try:
+        with WakeBridge(
+            root,
+            runner=args.runner,
+            wake_dir=args.wake_dir,
+            ack_dir=args.ack_dir,
+            max_retries=args.max_retries,
+            ack_timeout_seconds=args.ack_timeout,
+        ) as bridge:
+            result = bridge.run(poll_interval=args.poll_interval, once=bool(args.once))
+    except KeyboardInterrupt:
+        return EXIT_OK
+    emit_result(
+        result,
+        json_mode=json_mode,
+        human=f"bridge {args.runner}: {result['action']}",
+    )
     return EXIT_OK
 
 
@@ -927,6 +966,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
     "init": cmd_init,
     "distill": cmd_distill,
+    "bridge": cmd_bridge,
     "start": cmd_start,
     "stop": cmd_stop,
     "restart": cmd_restart,

@@ -172,6 +172,7 @@ stdout is not a terminal; `--no-json` forces the human rendering.
 | --- | --- |
 | `quay init [--bare]` | Create the ledger and conflict-safe tracked OKF scaffold; `--bare` creates runtime state only |
 | `quay distill [--stdout \| --out DIR] [--force-worktree] [--limit N]` | Materialize acknowledged handoffs into partitioned, bounded OKF concepts |
+| `quay bridge --runner R [--once] [--poll-interval S] [--ack-timeout S]` | Deliver one acknowledged wake at a time to a headless runner |
 | `quay start [--idle-seconds N]` | Start this workspace's daemon (`0` disables idle shutdown) |
 | `quay stop [--all --yes]` | Stop this daemon, or every registered daemon |
 | `quay restart` | Stop and start |
