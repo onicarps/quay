@@ -24,7 +24,7 @@ import socket
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, NoReturn, Sequence
 
 from . import __version__
 from .client import ClientError, QuayClient, SubscriptionStream
@@ -117,7 +117,7 @@ def _payload_from_text(text: str | None) -> dict[str, Any]:
 
 
 class _Parser(argparse.ArgumentParser):
-    def error(self, message: str) -> None:  # pragma: no cover - argparse path
+    def error(self, message: str) -> NoReturn:  # pragma: no cover - argparse path
         emit_error("usage", message, json_mode=not sys.stdout.isatty())
         raise SystemExit(EXIT_USAGE)
 
@@ -200,6 +200,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--ack-timeout", type=float, default=3600.0, help="seconds before an unacked wake is redelivered"
     )
     bridge.add_argument("--once", action="store_true", help="run one bridge cycle and exit")
+
+    run_parser = subparsers.add_parser(
+        "run",
+        parents=[common],
+        help="drive runner adapters from okf/harness/runners.toml",
+    )
+    run_parser.add_argument("--runner", default=None, help="named runner (default: first enabled)")
+    run_parser.add_argument("--config", default=None, help="path to runners.toml")
+    run_parser.add_argument("--once", action="store_true", help="run one runner cycle and exit")
+    run_parser.add_argument("--poll-interval", type=float, default=1.0, help="poll interval in seconds")
 
     start = subparsers.add_parser("start", parents=[common], help="start the daemon for this workspace")
     start.add_argument("--idle-seconds", type=float, default=None, help="idle shutdown timeout (0 disables)")
@@ -401,6 +411,46 @@ def cmd_bridge(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_run(args: argparse.Namespace) -> int:
+    from .runner import Runner, load_runner_config
+
+    json_mode = _json_mode(args)
+    root = workspace_path(args)
+    ensure_daemon(root, idle_seconds=0)
+    runners = load_runner_config(root, config=args.config)
+    name = args.runner
+    if name is None:
+        enabled = [runner for runner in runners.values() if runner.enabled]
+        if not enabled:
+            raise WorkspaceError(
+                "no_enabled_runner",
+                "no enabled [runner.<name>] table in the runners configuration",
+            )
+        name = enabled[0].name
+    elif name not in runners:
+        raise WorkspaceError(
+            "unknown_runner", f"no [runner.{name}] table in the runners configuration"
+        )
+    elif not runners[name].enabled:
+        raise WorkspaceError(
+            "runner_disabled", f"runner '{name}' is disabled in the runners configuration"
+        )
+    config = runners[name]
+    if args.poll_interval <= 0:
+        raise WorkspaceError("invalid_poll_interval", "poll interval must be positive")
+    try:
+        with Runner(root, config, poll_interval=args.poll_interval) as runner:
+            result = runner.run(once=bool(args.once))
+    except KeyboardInterrupt:
+        return EXIT_OK
+    emit_result(
+        result,
+        json_mode=json_mode,
+        human=f"runner {config.name}: {result.get('action')}",
+    )
+    return EXIT_OK
+
+
 def cmd_distill(args: argparse.Namespace) -> int:
     from .distill import distill_workspace
 
@@ -470,11 +520,11 @@ def cmd_stop(args: argparse.Namespace) -> int:
         )
         return EXIT_OK
     root = workspace_path(args, create=False)
-    stopped = stop_daemon(root)
+    was_stopped = stop_daemon(root)
     emit_result(
-        {"workspace": str(root), "stopped": stopped},
+        {"workspace": str(root), "stopped": was_stopped},
         json_mode=json_mode,
-        human="daemon stopped" if stopped else "no daemon was running",
+        human="daemon stopped" if was_stopped else "no daemon was running",
     )
     return EXIT_OK
 
@@ -967,6 +1017,7 @@ COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
     "init": cmd_init,
     "distill": cmd_distill,
     "bridge": cmd_bridge,
+    "run": cmd_run,
     "start": cmd_start,
     "stop": cmd_stop,
     "restart": cmd_restart,

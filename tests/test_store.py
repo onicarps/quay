@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import subprocess
 import sys
@@ -24,7 +23,6 @@ from quay.store import (
     LedgerStore,
     StoreError,
     canonical_body_text,
-    utc_now,
 )
 
 
@@ -268,7 +266,7 @@ class TestAppendAndChain:
 
 class TestReadsAndQuery:
     def test_get_and_tail(self, store: LedgerStore):
-        events = append_sample(store, 5)
+        append_sample(store, 5)
         assert store.get(3)["payload"] == {"i": 2}
         assert store.get(99) is None
         assert [e["seq"] for e in store.tail(2)] == [5, 4]
@@ -314,7 +312,7 @@ class TestReadsAndQuery:
 
     def test_query_by_correlation_and_causation(self, store: LedgerStore):
         first = store.append(topic="t", producer="p", payload={}, correlation_id="run-1")
-        second = store.append(topic="t", producer="p", payload={}, causation_id=first["seq"], correlation_id="run-1")
+        store.append(topic="t", producer="p", payload={}, causation_id=first["seq"], correlation_id="run-1")
         assert [e["seq"] for e in store.query(correlation_id="run-1")] == [1, 2]
         assert [e["seq"] for e in store.query(causation_id=first["seq"])] == [2]
 

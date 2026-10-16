@@ -162,6 +162,54 @@ writer runs only from the primary Git worktree. `--stdout` is a non-mutating
 preview, `--out DIR` selects another knowledge root, and `--force-worktree` is
 the explicit linked-worktree override.
 
+## Autonomous runner engine
+
+`quay bridge` delivers a wake, but something still has to read it, run the
+agent, and acknowledge it. `quay run` is that loop. It reads the tracked
+`okf/harness/runners.toml`, waits on the lossless wake bridge, and turns each
+delivered handoff into exactly one bounded adapter turn. No supervisor daemon
+is required: the runner spawns the adapter, captures its transcript, writes a
+result, and emits the companion `RUNNER_ACK`/`RUNNER_ERROR` handoff that lets
+the bridge advance (or retry) the cursor.
+
+```toml
+[runner.factory]
+enabled = true
+producer = "factory"
+accept_to = ["factory"]
+adapter = "command"
+adapter_command = "droid exec --auto"
+turn_timeout_seconds = 1800
+max_turns_per_chain = 10
+```
+
+```bash
+quay run --runner factory            # poll until interrupted
+quay run --runner factory --once     # exactly one cycle, then exit
+quay run --once                      # default to the first enabled runner
+```
+
+Per turn the runner:
+
+- reads the wake at `.quay/wake/<runner>/<seq>.json`;
+- refuses a turn whose causal chain depth exceeds `max_turns_per_chain`;
+- creates a private run directory `.quay/runs/<runner>/<seq>/` (mode `0700`)
+  and streams the adapter's stdout/stderr into `run.log`;
+- spawns `adapter_command` through the shell in a new process group, with
+  `QUAY_WORKSPACE`, `QUAY_RUNNER`, `QUAY_EVENT_SEQ`, `QUAY_PRODUCER`,
+  `QUAY_TOPIC`, `QUAY_SENDER`, and `QUAY_RUN_DIR` in the environment and the
+  wake JSON on stdin, killing the group if it exceeds `turn_timeout_seconds`;
+- writes `result.json` (`status` of `completed`, `error`, `timeout`, or
+  `rejected`) and emits the matching companion handoff, then drops the
+  acknowledgement so the bridge advances on success or redelivers on error.
+
+`runners.toml` is the reviewed source of truth. `runs_dir` is a runs root and
+the runner name partitions it, so two runners never collide on a sequence
+number. An `[runner.<name>]` table defaults to `enabled = true`, `producer` and
+`accept_to` of `[<name>]`, `wake_dir = .quay/wake/<name>`,
+`runs_dir = .quay/runs`, `ack_mode = "done-file"`, `adapter = "command"`,
+`turn_timeout_seconds = 1800`, and `max_turns_per_chain = 10`.
+
 ## CLI reference
 
 Common flags on every command: `--workspace PATH` (default: the current
@@ -173,6 +221,7 @@ stdout is not a terminal; `--no-json` forces the human rendering.
 | `quay init [--bare]` | Create the ledger and conflict-safe tracked OKF scaffold; `--bare` creates runtime state only |
 | `quay distill [--stdout \| --out DIR] [--force-worktree] [--limit N]` | Materialize acknowledged handoffs into partitioned, bounded OKF concepts |
 | `quay bridge --runner R [--once] [--poll-interval S] [--ack-timeout S]` | Deliver one acknowledged wake at a time to a headless runner |
+| `quay run [--runner R] [--config PATH] [--once] [--poll-interval S]` | Drive a runner adapter from `okf/harness/runners.toml`: execute one turn per wake, log it, and emit the companion `RUNNER_ACK`/`RUNNER_ERROR` |
 | `quay start [--idle-seconds N]` | Start this workspace's daemon (`0` disables idle shutdown) |
 | `quay stop [--all --yes]` | Stop this daemon, or every registered daemon |
 | `quay restart` | Stop and start |
