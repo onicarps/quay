@@ -1,6 +1,6 @@
 {
   "name": "@agentbus/quay",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Local-first streaming event ledger and terminal cockpit for one workspace",
   "license": "MIT",
   "bin": {

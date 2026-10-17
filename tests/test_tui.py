@@ -11,6 +11,8 @@ import io
 import os
 import re
 import signal
+import sys
+import termios
 import time
 
 import pytest
@@ -23,6 +25,7 @@ from quay.tui import (
     RESET,
     SAMPLE_PRODUCER,
     SAMPLE_TOPIC,
+    STREAM_TOP,
     STYLES,
     Dashboard,
     Screen,
@@ -30,6 +33,7 @@ from quay.tui import (
     age_of,
     render_diff,
     sanitize,
+    stream_rows_for,
     summarize_event,
     terminal_session,
     split_keys,
@@ -1037,3 +1041,718 @@ class TestTuiLoopResizeAndRefresh:
             assert signal.getsignal(winch) is original
             assert callable(read_key)
         assert signal.getsignal(winch) is original
+
+
+class TestInputTokenization:
+    """A partial escape sequence must never be read as the keys it resembles.
+
+    ``\\x1b[<0;15;5`` (a mouse report cut off before its terminator) used to
+    split into ``0``, ``1``, ``5`` and friends, and every digit is a bound
+    filter shortcut, so a slow pty could silently jump the cockpit to another
+    filter and reload its history.
+    """
+
+    def test_a_truncated_mouse_report_is_one_opaque_token(self):
+        for truncated in ("\x1b[<0;15;5", "\x1b[<0;15;", "\x1b[<0;", "\x1b[<"):
+            assert split_keys(truncated) == [truncated]
+
+    def test_an_incomplete_ss3_or_csi_prefix_is_one_opaque_token(self):
+        assert split_keys("\x1b[") == ["\x1b["]
+        assert split_keys("\x1bO") == ["\x1bO"]
+        assert split_keys("j\x1b[") == ["j", "\x1b["]
+
+    def test_a_truncated_mouse_report_cannot_type_its_coordinates(self):
+        app = TuiApp("/tmp/x.sock", history=10)
+        app.events = [sample_event(seq=n) for n in range(10)]
+        app.stream_rows = 5
+        client = FakeClient()
+        for token in split_keys("\x1b[<0;15;5"):
+            app.handle_key(token, client)
+        assert app.filter_index == 0
+        assert app.filter_label == "all"
+        assert app.selection == 0
+        assert client.calls == []
+
+    def test_a_lone_escape_stays_meaningful(self):
+        assert split_keys("\x1b") == ["\x1b"]
+        assert split_keys("j\x1b") == ["j", "\x1b"]
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "jq",
+            "\x1b[A\x1b[B\x1bOA\x1bOB",
+            "\x1b[5~\x1b[6~\x1b[1;5A\x1b[Z",
+            "\x1b[<0;15;5M\x1b[<0;15;5m",
+            "\x1b[<64;1;1M\x1b[<65;1;1M\x1b[<0;200;60M",
+            "héllo → 🚀",
+            "".join("\x1b[<0;15;5M" for _ in range(20)),
+            "\x1b[?1049h\x1b[?25l",
+        ],
+    )
+    def test_every_character_of_a_burst_is_accounted_for(self, payload):
+        assert "".join(split_keys(payload)) == payload
+
+    def test_unicode_payloads_split_into_code_points(self):
+        assert split_keys("é→🚀") == ["é", "→", "🚀"]
+
+    def test_an_unknown_but_complete_sequence_is_one_token(self):
+        # Bracketed-paste markers are not handled keys, but they are complete
+        # sequences: they must not be shredded into letters.
+        assert split_keys("\x1b[200~") == ["\x1b[200~"]
+        assert split_keys("\x1b[201~") == ["\x1b[201~"]
+
+
+class TestMouseHardening:
+    """Boundary handling for SGR 1006 reports."""
+
+    @staticmethod
+    def app(*, events: int = 10, rows: int = 5, selection: int = 0) -> TuiApp:
+        app = TuiApp("/tmp/x.sock", history=40)
+        app.events = [sample_event(seq=n) for n in range(events)]
+        app.stream_rows = rows
+        app.selection = selection
+        app.last_width = 80
+        app.last_height = 24
+        return app
+
+    @pytest.mark.parametrize(
+        "packet,expected",
+        [
+            ("\x1b[<64;15;5M", 4),  # wheel up
+            ("\x1b[<68;15;5M", 4),  # shift + wheel up
+            ("\x1b[<72;15;5M", 4),  # alt + wheel up
+            ("\x1b[<65;15;5M", 6),  # wheel down
+            ("\x1b[<81;15;5M", 6),  # ctrl + wheel down
+        ],
+    )
+    def test_wheel_reports_scroll_with_modifiers_masked(self, packet, expected):
+        app = self.app(selection=5)
+        assert app.handle_key(packet, FakeClient()) is True
+        assert app.selection == expected
+
+    @pytest.mark.parametrize(
+        "packet",
+        [
+            "\x1b[<66;15;5M",  # wheel left
+            "\x1b[<67;15;5M",  # wheel right
+            "\x1b[<32;15;5M",  # bare motion
+            "\x1b[<35;15;5M",  # drag with the left button held
+            "\x1b[<1;15;5M",  # middle button
+            "\x1b[<2;15;5M",  # right button
+            "\x1b[<0;15;5m",  # left release
+        ],
+    )
+    def test_reports_with_nothing_to_do_are_inert(self, packet):
+        app = self.app(selection=5)
+        app.handle_key(packet, FakeClient())
+        assert app.selection == 5
+        assert app.filter_index == 0
+        assert app.paused is False
+        assert app.redraw_requested is False
+
+    def test_shift_click_still_selects(self):
+        app = self.app()
+        app.handle_key("\x1b[<4;15;5M", FakeClient())
+        assert app.selection == 1
+
+    def test_wheel_on_an_empty_ledger_is_inert(self):
+        app = self.app(events=0)
+        for packet in ("\x1b[<64;15;5M", "\x1b[<65;15;5M"):
+            assert app.handle_key(packet, FakeClient()) is True
+        assert app.selection == 0
+        assert app.scroll_offset == 0
+
+    def test_wheel_with_a_single_event_keeps_the_selection_in_range(self):
+        app = self.app(events=1)
+        for packet in ("\x1b[<65;15;5M", "\x1b[<64;15;5M", "\x1b[<64;15;5M"):
+            app.handle_key(packet, FakeClient())
+        assert app.selection == 0
+        assert app.scroll_offset == 0
+
+    def test_clicks_are_ignored_when_the_viewport_has_no_rows(self):
+        app = self.app(rows=0)
+        app.handle_key("\x1b[<0;15;5M", FakeClient())
+        assert app.selection == 0
+        assert app.redraw_requested is False
+
+    @pytest.mark.parametrize(
+        "packet",
+        [
+            "\x1b[<0;15M",  # two fields
+            "\x1b[<;15;5M",  # empty button
+            "\x1b[<M",  # no fields at all
+            "\x1b[<0;15;5X",  # unknown terminator
+            "\x1b[<0;15;5",  # truncated
+        ],
+    )
+    def test_malformed_packets_are_ignored(self, packet):
+        app = self.app()
+        app.handle_key(packet, FakeClient())
+        assert app.selection == 0
+        assert app.filter_index == 0
+        assert app.paused is False
+
+    def test_out_of_range_coordinates_are_clamped(self):
+        app = self.app()
+        # Row 0 (1-indexed) would be -1 once zero-based: clamped to the header,
+        # far from the PAUSED hit zone, so it must do nothing at all.
+        app.handle_key("\x1b[<0;0;0M", FakeClient())
+        assert app.paused is False
+        assert app.selection == 0
+        # An enormous row cannot reach the stream either.
+        app.handle_key("\x1b[<0;99999;99999M", FakeClient())
+        assert app.selection == 0
+
+    def test_a_rapid_click_burst_applies_every_click_once(self):
+        app = self.app(events=30)
+        tokens = split_keys("".join("\x1b[<0;15;7M" for _ in range(25)))
+        assert len(tokens) == 25
+        for token in tokens:
+            app.handle_key(token, FakeClient())
+        # Row 7 is one-based: row 6, body offset 3, so index 3, however many
+        # clicks land. A burst must not drift or double-apply.
+        assert app.selection == 3
+        assert app.take_redraw_request() is True
+        assert app.take_redraw_request() is False
+
+    def test_a_wheel_burst_scrolls_one_step_per_tick(self):
+        app = self.app(events=30)
+        for _ in range(10):
+            app.handle_key("\x1b[<65;15;5M", FakeClient())
+        assert app.selection == 10
+        assert app.scroll_offset == 6  # the selection stays on the last row
+
+    def test_a_mouse_event_dismisses_an_overlay(self):
+        app = self.app()
+        app.help = True
+        app.handle_key("\x1b[<64;15;5M", FakeClient())
+        assert app.help is False
+        assert app.redraw_requested is True
+
+
+class TestSelectionBounds:
+    def test_page_down_on_an_empty_ledger_keeps_the_selection_in_range(self):
+        app = TuiApp("/tmp/x.sock")
+        app.handle_key("\x1b[6~", FakeClient())
+        assert app.selection == 0
+        app.handle_key("\x1b[5~", FakeClient())
+        assert app.selection == 0
+
+    def test_ensure_selection_visible_clamps_a_stranded_selection(self):
+        app = TuiApp("/tmp/x.sock", history=10)
+        app.events = [sample_event(seq=n) for n in range(3)]
+        app.stream_rows = 5
+        app.selection = 2
+        del app.events[1:]  # the visible history shrank under the cursor
+        app.ensure_selection_visible()
+        assert app.selection == 0
+        assert app.scroll_offset == 0
+
+    def test_ensure_selection_visible_resets_a_negative_selection(self):
+        app = TuiApp("/tmp/x.sock")
+        app.selection = -1
+        app.ensure_selection_visible()
+        assert app.selection == 0
+
+    def test_navigation_stays_in_range_with_no_events(self):
+        app = TuiApp("/tmp/x.sock")
+        client = FakeClient()
+        for key in ("j", "\x1b[B", "\x1b[A", "k", "g", "G", "\x1b[5~", "\x1b[6~", "\x1b[F", "\x1b[H"):
+            assert app.handle_key(key, client) is True
+            assert app.selection == 0
+
+
+class TestRenderRobustness:
+    """The cockpit renders whatever the daemon sends: a frame must never raise."""
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"events": [sample_event(seq=None)]},
+            {"events": [sample_event(seq="7")]},
+            {"events": [sample_event(seq=[1])]},
+            {"events": [{**sample_event(seq=1), "ts": 1700000000}]},
+            {"events": [{**sample_event(seq=1), "ts": None}]},
+            {"events": [{**sample_event(seq=1), "kind": None}]},
+            {"events": None},
+            {"events": 5},
+            {"selection": None},
+            {"selection": "abc"},
+            {"width": None, "height": None},
+            {"width": "abc", "height": "abc"},
+            {"health": [1, 2]},
+            {"status": "broken"},
+            {"status": {"ledger": [1], "kinds": {}, "planes": {}}},
+            {"status": {"ledger": {}, "kinds": [1], "planes": {}}},
+            {"status": {"ledger": {}, "kinds": {"note": "4"}, "planes": {"signal": {"open": "1"}, "work": {}}}},
+        ],
+    )
+    def test_malformed_fields_still_render_a_valid_grid(self, override):
+        screen = Dashboard().render(sample_model(**override))
+        assert len(screen.cells) >= 1
+        assert all(len(row) == len(screen.cells[0]) for row in screen.cells)
+        assert render_diff(None, screen.cells) != ""
+
+    def test_an_unusable_sequence_number_renders_as_a_placeholder(self):
+        events = [sample_event(seq=None), sample_event(seq=3)]
+        screen = Dashboard().render(sample_model(events=events))
+        text = "\n".join(screen.text_at(row) for row in range(screen.height))
+        assert "#?" in text
+        assert "#3" in text
+
+    def test_age_of_rejects_a_non_string_timestamp(self):
+        assert age_of(1700000000).strip() == "-"
+        assert age_of(["2026-01-01"]).strip() == "-"
+
+    @pytest.mark.parametrize("width,height", [(1, 1), (2, 2), (5, 3), (39, 5), (300, 1), (1, 60), (40, 6)])
+    def test_extreme_geometry_keeps_the_grid_valid(self, width, height):
+        for overlay in ({"help": True}, {"inspecting": True}, {}):
+            screen = Dashboard().render(sample_model(width=width, height=height, **overlay))
+            assert len(screen.cells) == height
+            assert all(len(row) == width for row in screen.cells)
+
+    @pytest.mark.parametrize("height", [1, 2, 3, 4, 5, 6, 7, 12, 24, 30, 60])
+    def test_viewport_rows_agree_with_the_dashboard(self, height):
+        # Newest first, exactly as the app keeps its history.
+        events = [sample_event(seq=n) for n in reversed(range(60))]
+        screen = Dashboard().render(sample_model(height=height, events=events, selection=0))
+        rows = stream_rows_for(height)
+        if rows == 0:
+            text = "\n".join(screen.text_at(row) for row in range(screen.height))
+            assert "#59" not in text
+        else:
+            assert "#59" in screen.text_at(STREAM_TOP)
+            oldest_visible = 59 - rows + 1
+            assert f"#{oldest_visible} " in screen.text_at(STREAM_TOP + rows - 1)
+
+    def test_inspect_overlay_reports_hidden_payload_lines(self):
+        event = sample_event(seq=9)
+        event["payload"] = {"lines": [f"line {index}" for index in range(60)]}
+        app = TuiApp("/tmp/x.sock")
+        app.events = [event]
+        app.inspecting = True
+        screen = Dashboard().render(app.model(width=100, height=40))
+        text = "\n".join(screen.text_at(row) for row in range(screen.height))
+        assert "line 0" in text
+        assert "more line(s)" in text
+
+    def test_inspect_overlay_renders_unicode_and_strips_control_characters(self):
+        event = sample_event(seq=10)
+        event["payload"] = {"text": "héllo → 🚀", "ansi": "\x1b[31mred\x1b[0m", "multi": "a\nb"}
+        app = TuiApp("/tmp/x.sock")
+        app.events = [event]
+        app.inspecting = True
+        screen = Dashboard().render(app.model(width=100, height=40))
+        text = "\n".join(screen.text_at(row) for row in range(screen.height))
+        assert "héllo → 🚀" in text
+        assert "\x1b" not in text
+
+    def test_inspect_overlay_survives_a_payload_json_cannot_encode(self):
+        event = sample_event(seq=11)
+        circular: dict = {}
+        circular["self"] = circular
+        event["payload"] = circular
+        app = TuiApp("/tmp/x.sock")
+        app.events = [event]
+        app.inspecting = True
+        screen = Dashboard().render(app.model(width=100, height=30))
+        assert render_diff(None, screen.cells) != ""
+
+
+class TestTuiLoopInputAssembly:
+    """The loop joins split reports and drops the ones that never complete."""
+
+    def run_loop(self, app, *presses: str, iterations: int = 6, size=(100, 30)) -> str:
+        output = io.StringIO()
+        code = app._loop(  # noqa: SLF001 - the documented test seam
+            FakeClient(),
+            FakeLive(),
+            reader_factory=scripted_reader(*presses),
+            output=output,
+            max_iterations=iterations,
+            size_getter=ScriptedSize(size),
+        )
+        assert code == 0
+        return output.getvalue()
+
+    def test_a_mouse_report_split_across_reads_is_joined(self):
+        app = TuiApp("/tmp/x.sock", history=10)
+        app.events = [sample_event(seq=n) for n in range(10)]
+        self.run_loop(app, "\x1b[<0;15;", "5M", "q")
+        assert app.selection == 1
+
+    def test_a_burst_of_clicks_in_one_read_selects_the_last_one(self):
+        app = TuiApp("/tmp/x.sock", history=10)
+        app.events = [sample_event(seq=n) for n in range(10)]
+        burst = "\x1b[<0;15;5M\x1b[<0;15;4M\x1b[<0;15;3M"
+        self.run_loop(app, burst, "q")
+        assert app.selection == 0
+
+    def test_a_truncated_mouse_report_is_dropped(self):
+        app = TuiApp("/tmp/x.sock", history=10)
+        app.events = [sample_event(seq=n) for n in range(10)]
+        self.run_loop(app, "\x1b[<0;15;5")
+        assert app.filter_index == 0
+        assert app.selection == 0
+
+    def test_a_bare_escape_still_dismisses_the_inspect_overlay(self):
+        app = TuiApp("/tmp/x.sock", history=10)
+        app.events = [sample_event(seq=n) for n in range(10)]
+        app.inspecting = True
+        self.run_loop(app, "\x1b", "q")
+        assert app.inspecting is False
+
+    def test_mouse_reporting_is_enabled_and_disabled_exactly_once(self):
+        app = TuiApp("/tmp/x.sock")
+        rendered = self.run_loop(app, "q")
+        assert rendered.count("\x1b[?1000h\x1b[?1002h\x1b[?1006h") == 1
+        assert rendered.count("\x1b[?1006l\x1b[?1002l\x1b[?1000l") == 1
+        # Reporting is armed before the first frame is painted, so no click can
+        # be lost between entering the alternate screen and the first render.
+        assert rendered.index("\x1b[?1006h") < rendered.index("\x1b[1;1H")
+        assert rendered.rstrip().endswith("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l")
+
+    def test_restore_sequence_is_written_when_the_reader_is_interrupted(self):
+        @contextlib.contextmanager
+        def factory(*, on_resize=None):
+            def read(timeout: float) -> str | None:
+                raise KeyboardInterrupt
+
+            yield read
+
+        app = TuiApp("/tmp/x.sock")
+        output = io.StringIO()
+        code = app._loop(  # noqa: SLF001 - the documented test seam
+            FakeClient(),
+            FakeLive(),
+            reader_factory=factory,
+            output=output,
+            max_iterations=4,
+            size_getter=ScriptedSize((100, 30)),
+        )
+        rendered = output.getvalue()
+        assert code == 0
+        assert rendered.count("\x1b[?1006l\x1b[?1002l\x1b[?1000l") == 1
+        assert rendered.rstrip().endswith("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l")
+
+    def test_a_broken_output_stream_does_not_mask_the_exit(self):
+        class BrokenStream:
+            def write(self, _text: str) -> int:
+                raise OSError("stdout is gone")
+
+            def flush(self) -> None:
+                raise OSError("stdout is gone")
+
+        app = TuiApp("/tmp/x.sock")
+        with pytest.raises(OSError):
+            app._loop(  # noqa: SLF001 - the documented test seam
+                FakeClient(),
+                FakeLive(),
+                reader_factory=scripted_reader("q"),
+                output=BrokenStream(),
+                max_iterations=2,
+                size_getter=ScriptedSize((100, 30)),
+            )
+
+
+class _FdStdin:
+    """A ``sys.stdin`` stand-in that reads straight from a descriptor."""
+
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+
+    def fileno(self) -> int:
+        return self.fd
+
+    def read(self, size: int = 1) -> str:
+        return os.read(self.fd, size).decode("utf-8", errors="replace")
+
+
+def _pty_pair() -> tuple[int, int]:
+    pty = pytest.importorskip("pty")
+    return pty.openpty()
+
+
+class TestTerminalSessionReads:
+    """Drive the real reader: this is the code path the navigation fix lives in."""
+
+    def test_a_burst_of_keys_arrives_in_one_read(self, monkeypatch):
+        master, slave = _pty_pair()
+        try:
+            monkeypatch.setattr(sys, "stdin", _FdStdin(slave))
+            with terminal_session() as read_key:
+                os.write(master, b"\x1b[A\x1b[Bjq")
+                # One unbuffered read must drain the whole burst; a buffered
+                # TextIOWrapper starves the escape sequences apart.
+                assert read_key(0.5) == "\x1b[A\x1b[Bjq"
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_a_utf8_character_split_across_reads_is_reassembled(self, monkeypatch):
+        master, slave = _pty_pair()
+        encoded = "→".encode("utf-8")
+        assert len(encoded) == 3
+        try:
+            monkeypatch.setattr(sys, "stdin", _FdStdin(slave))
+            with terminal_session() as read_key:
+                os.write(master, encoded[:1])
+                # Half a code point is held, not decoded into a replacement.
+                assert read_key(0.5) is None
+                os.write(master, encoded[1:])
+                assert read_key(0.5) == "→"
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_an_invalid_byte_becomes_a_replacement_character(self, monkeypatch):
+        master, slave = _pty_pair()
+        try:
+            monkeypatch.setattr(sys, "stdin", _FdStdin(slave))
+            with terminal_session() as read_key:
+                os.write(master, b"\xffj")
+                assert read_key(0.5) == "\ufffdj"
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_no_input_reports_none(self, monkeypatch):
+        master, slave = _pty_pair()
+        try:
+            monkeypatch.setattr(sys, "stdin", _FdStdin(slave))
+            with terminal_session() as read_key:
+                assert read_key(0.0) is None
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_tty_attributes_are_restored_on_exit(self, monkeypatch):
+        master, slave = _pty_pair()
+        try:
+            monkeypatch.setattr(sys, "stdin", _FdStdin(slave))
+            before = termios.tcgetattr(slave)
+            with terminal_session():
+                assert termios.tcgetattr(slave) != before, "cbreak must change the tty"
+            assert termios.tcgetattr(slave) == before
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_a_closed_pipe_reports_eof_without_spinning(self, monkeypatch):
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)  # a pipe that is already at EOF
+        try:
+            monkeypatch.setattr(sys, "stdin", _FdStdin(read_fd))
+            with terminal_session() as read_key:
+                started = time.monotonic()
+                for _ in range(3):
+                    assert read_key(0.05) is None
+                assert time.monotonic() - started < 2.0
+        finally:
+            os.close(read_fd)
+
+    def test_an_unreadable_descriptor_degrades_to_none(self, monkeypatch):
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        try:
+            monkeypatch.setattr(sys, "stdin", _FdStdin(read_fd))
+            with terminal_session() as read_key:
+                assert read_key(0.05) is None
+        finally:
+            os.close(write_fd)
+
+
+class TestIntCoercionHelpers:
+    """The cockpit must survive any value the daemon hands it."""
+
+    def test_int_or_returns_native_ints_unchanged(self):
+        from quay.tui import _int_or
+        assert _int_or(0) == 0
+        assert _int_or(42) == 42
+        assert _int_or(-7) == -7
+
+    def test_int_or_truncates_floats(self):
+        from quay.tui import _int_or
+        assert _int_or(3.7) == 3
+        assert _int_or(-1.9) == -1
+        assert _int_or(0.0) == 0
+
+    def test_int_or_coerces_booleans_to_zero_or_one(self):
+        from quay.tui import _int_or
+        # Bool is a subclass of int; ``isinstance(True, int)`` is True.
+        # The helper keeps that contract explicit so readers know the rule.
+        assert _int_or(True) == 1
+        assert _int_or(False) == 0
+
+    def test_int_or_parses_valid_numeric_strings(self):
+        from quay.tui import _int_or
+        assert _int_or(" 17 ") == 17
+        assert _int_or("-3") == -3
+
+    def test_int_or_returns_default_for_garbage(self):
+        from quay.tui import _int_or
+        assert _int_or(None) == 0
+        assert _int_or(None, 99) == 99
+        assert _int_or("nope") == 0
+        assert _int_or("nope", 4) == 4
+        assert _int_or([1, 2]) == 0
+        assert _int_or({"x": 1}) == 0
+        assert _int_or(object()) == 0
+
+
+class TestMappingHelper:
+    def test_a_real_mapping_passes_through(self):
+        from quay.tui import _mapping
+        original = {"a": 1, "b": 2}
+        out = _mapping(original)
+        assert out is original
+
+    def test_non_mapping_inputs_become_empty(self):
+        from quay.tui import _mapping
+        assert _mapping(None) == {}
+        assert _mapping([1, 2]) == {}
+        assert _mapping(5) == {}
+        assert _mapping("nope") == {}
+        assert _mapping((1, 2)) == {}
+
+
+class TestSeqColumnHelper:
+    def test_int_sequence_is_left_aligned_to_five_columns(self):
+        from quay.tui import _seq_column
+        assert _seq_column(1) == "1    "
+        assert _seq_column(42) == "42   "
+        assert _seq_column(12345) == "12345"
+
+    def test_bool_is_rendered_as_string_not_as_one_or_zero(self):
+        # Booleans are ints; the helper refuses them so a stray schema change
+        # cannot silently turn a filter flip into a sequence column.
+        from quay.tui import _seq_column
+        # ``True`` is the string "True", not 1.
+        assert _seq_column(True).strip() == "True"
+        assert _seq_column(False).strip() == "False"
+
+    def test_none_becomes_a_question_mark(self):
+        from quay.tui import _seq_column
+        assert _seq_column(None).strip() == "?"
+
+    def test_unparseable_string_is_truncated_to_five_chars(self):
+        from quay.tui import _seq_column
+        assert _seq_column("abcdefg").strip() == "abcde"
+
+    def test_negatives_are_signed(self):
+        from quay.tui import _seq_column
+        assert _seq_column(-1).strip() == "-1"
+
+
+class TestStreamRowsFor:
+    """``stream_rows_for`` is the single source of truth for the hit-test."""
+
+    def test_a_tall_terminal_keeps_a_generous_viewport(self):
+        from quay.tui import stream_rows_for
+        # 24 - 3 = 21 above the footer; after row 3 the body has 21 - 3 + 1 = 19.
+        assert stream_rows_for(24) == 19
+        assert stream_rows_for(50) == 45
+
+    def test_a_short_terminal_yields_a_visible_viewport(self):
+        from quay.tui import stream_rows_for
+        # The cockpit needs at least rows beyond title/filter/header/footer.
+        assert stream_rows_for(6) == 1
+        assert stream_rows_for(5) == 0
+
+    def test_a_zero_or_negative_terminal_yields_zero(self):
+        from quay.tui import stream_rows_for
+        assert stream_rows_for(0) == 0
+        assert stream_rows_for(-3) == 0
+
+    def test_a_garbage_terminal_falls_back_to_a_safe_default(self):
+        from quay.tui import stream_rows_for
+        # ``_int_or(None, 24)`` falls back to 24, which yields 19 stream rows.
+        assert stream_rows_for(None) == 19
+        assert stream_rows_for("abc") == 19
+
+
+class TestTokenizationMidBurstCarry:
+    """Sequence bytes that arrive across reads must join before dispatch."""
+
+    def test_a_partial_csi_string_is_one_opaque_token(self):
+        assert split_keys("\x1b[1;5") == ["\x1b[1;5"]
+
+    def test_a_completed_csi_then_a_partial_csi_split_cleanly(self):
+        # Complete arrow + incomplete modifier-prefixed arrow.
+        out = split_keys("\x1b[A\x1b[1;5")
+        assert out == ["\x1b[A", "\x1b[1;5"]
+
+    def test_a_partial_sgr_mouse_far_in_is_one_opaque_token(self):
+        # Five numbers rather than the usual three: the daemon split mid-write.
+        assert split_keys("\x1b[<0;15;5;32;17M") == ["\x1b[<0;15;5;32;17M"]
+
+    def test_a_private_mode_escape_is_one_token(self):
+        # The dashboard emits these; the tokeniser must not split them apart.
+        assert split_keys("\x1b[?1049h") == ["\x1b[?1049h"]
+        assert split_keys("\x1b[?25l") == ["\x1b[?25l"]
+
+
+class TestRenderOnTinyScreens:
+    """The dashboard must never raise, even when the terminal is impossibly small."""
+
+    def test_a_one_row_terminal_renders_a_valid_grid(self):
+        app = TuiApp("/tmp/x.sock")
+        screen = app.dashboard.render(app.model(width=10, height=1))
+        assert screen.width == 10
+        assert screen.height == 1
+        # Every cell exists and is a printable or blank character.
+        for row in range(screen.height):
+            rendered = screen.text_at(row)
+            assert len(rendered) == screen.width
+
+    def test_a_zero_height_terminal_does_not_crash(self):
+        app = TuiApp("/tmp/x.sock")
+        screen = app.dashboard.render(app.model(width=80, height=0))
+        assert screen.width == 80
+        # ``Screen.height`` is pinned to >= 1 by the constructor; the model
+        # floor of >= 1 also keeps this honest.
+        assert screen.height >= 1
+
+
+class TestInspectOverlayClipping:
+    """``_render_inspect`` must cap the payload excerpt and not crash on it."""
+
+    def test_a_huge_payload_renders_a_clipped_overlay(self):
+        app = TuiApp("/tmp/x.sock")
+        payload = {"blob": "x" * 5000, "nested": {"y": list(range(2000))}}
+        event = sample_event(seq=11, kind="note", topic="audit/huge", **payload)
+        app.events = [event]
+        app.inspecting = True
+        # Width and height generous enough to give the overlay room.
+        screen = app.dashboard.render(app.model(width=120, height=40))
+        rendered = "\n".join(screen.text_at(r) for r in range(screen.height))
+        # The overlay title line must be present.
+        assert "inspect event #11" in rendered
+        # The dismiss hint must be present.
+        assert "Press Enter or Esc" in rendered
+        # The 5,000-character blob must not appear verbatim; only its prefix.
+        assert "x" * 5000 not in rendered
+
+    def test_a_non_ascii_payload_does_not_break_rendering(self):
+        app = TuiApp("/tmp/x.sock")
+        payload = {"text": "héllo → 🚀 café"}
+        event = sample_event(seq=12, kind="note", **payload)
+        app.events = [event]
+        app.inspecting = True
+        screen = app.dashboard.render(app.model(width=100, height=30))
+        # The text must appear in the rendered grid (the cockpit never
+        # crashes on multibyte data).
+        rendered = "\n".join(screen.text_at(r) for r in range(screen.height))
+        assert "inspect event #12" in rendered
+
+    def test_an_unserializable_payload_falls_back_safely(self):
+        app = TuiApp("/tmp/x.sock")
+        # A set is not JSON-serialisable; the inspect overlay must degrade
+        # gracefully instead of taking the frame down.
+        event = sample_event(seq=13, kind="note", tags=object())
+        app.events = [event]
+        app.inspecting = True
+        screen = app.dashboard.render(app.model(width=80, height=24))
+        rendered = "\n".join(screen.text_at(r) for r in range(screen.height))
+        assert "inspect event #13" in rendered

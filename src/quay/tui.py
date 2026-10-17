@@ -21,6 +21,7 @@ tears under load; Quay writes only what changed, as fast as events arrive.
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import io
 import os
@@ -65,6 +66,34 @@ CLEAR_SCREEN = "\x1b[2J\x1b[H"
 
 #: Ctrl-L: repaint the screen without touching the model or the ledger.
 REFRESH_KEY = "\x0c"
+
+#: Alternate-screen and cursor toggles live in one place so every exit path
+#: leaves the terminal the way the cockpit found it.
+ALT_SCREEN_ON = "\x1b[?1049h"
+ALT_SCREEN_OFF = "\x1b[?1049l"
+CURSOR_HIDE = "\x1b[?25l"
+CURSOR_SHOW = "\x1b[?25h"
+
+#: SGR 1006 mouse reporting: 1000 reports button presses, 1002 adds drag
+#: tracking, and 1006 selects the ``\x1b[<b;col;row`` coordinate encoding that
+#: makes a click addressable instead of a cursor-relative guess.
+MOUSE_ON = "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
+MOUSE_OFF = "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
+
+#: The event stream always starts on row 3: title, filter bar, column header.
+STREAM_TOP = 3
+
+#: Payload lines the inspect overlay shows before it says how many it hid.
+_INSPECT_PAYLOAD_LINES = 14
+
+#: How far right of the header a click counts as hitting the PAUSED marker.
+_PAUSED_CLICK_ZONE = 30
+
+#: Reading a burst: wait this long for the rest of an unfinished escape
+#: sequence, at most this many times, and never buffer more than this much.
+_TAIL_READ_TIMEOUT = 0.02
+_MAX_TAIL_READS = 8
+_MAX_INPUT_BYTES = 4096
 
 KIND_STYLE = {
     "signal": "signal",
@@ -137,6 +166,8 @@ def render_diff(
     width = len(current[0]) if current else 0
     output: list[str] = []
     for row in range(height):
+        cells = current[row]
+        row_width = min(width, len(cells))
         run_start: int | None = None
         run_style: str | None = None
         run_text: list[str] = []
@@ -151,8 +182,8 @@ def render_diff(
             run_style = None
             run_text = []
 
-        for col in range(width):
-            cell = current[row][col]
+        for col in range(row_width):
+            cell = cells[col]
             same = (
                 previous is not None
                 and row < len(previous)
@@ -180,6 +211,44 @@ def _shorten(value: str, limit: int) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "…"
 
 
+def _int_or(value: object, default: int = 0) -> int:
+    """Coerce an untrusted model value to ``int`` without ever raising.
+
+    The cockpit renders whatever the daemon sends, so a count that arrives as a
+    string (or as ``None`` after a schema change) must degrade to a number
+    instead of taking the whole frame down with a ``ValueError``.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _mapping(value: object) -> Mapping[str, Any]:
+    """Return ``value`` when it is a mapping, otherwise an empty one."""
+    return value if isinstance(value, Mapping) else {}
+
+
+def _events_of(model: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]:
+    """Return the model's event list, or an empty one when it is unusable."""
+    events = model.get("events")
+    return events if isinstance(events, (list, tuple)) else ()
+
+
+def _seq_column(value: object) -> str:
+    """Format a sequence number for the stream column, whatever it holds."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return f"{value:<5d}"
+    text = "?" if value is None else str(value)
+    return f"{text:<5.5s}"
+
+
 def summarize_event(event: Mapping[str, Any], limit: int = 64) -> str:
     """Return a one-line human summary of an event's payload."""
     payload = event.get("payload")
@@ -204,15 +273,15 @@ def summarize_event(event: Mapping[str, Any], limit: int = 64) -> str:
     return _shorten(compact, limit)
 
 
-def age_of(timestamp: str | None, *, now: float | None = None) -> str:
+def age_of(timestamp: object, *, now: float | None = None) -> str:
     """Return a compact age such as ``3s`` or ``2m`` for an ISO timestamp."""
-    if not timestamp:
+    if not isinstance(timestamp, str) or not timestamp:
         return "  -"
     try:
         from .store import parse_ts
 
         moment = parse_ts(timestamp).timestamp()
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError, OSError):
         return "  -"
     seconds = max(0.0, (time.time() if now is None else now) - moment)
     if seconds < 60:
@@ -278,17 +347,75 @@ SAMPLE_PRODUCER = "quay"
 #: help overlay lists the full set of keys, including the detail toggle.
 HINT_LINE = " q detach  ↑↓/click move  enter inspect  space pause  f filter  s sample  v verify  ctrl-l refresh  ? help"
 
-_KEY_SPLIT_PATTERN = re.compile(
-    r"(\x1b\[<[0-9]+;[0-9]+;[0-9]+[Mm]|\x1b\[[0-9;?]*[A-Za-z~]|\x1bO[A-Za-z]|\x1b|.)",
-    re.DOTALL,
-)
+#: One SGR mouse report: ``\x1b[<button;column;row`` closed by ``M`` for a press
+#: or a wheel tick, and by ``m`` for a release.
+_SGR_MOUSE_PATTERN = re.compile(r"\x1b\[<([0-9]+);([0-9]+);([0-9]+)([Mm])")
+#: Any complete CSI sequence: arrows, page keys, function keys, private modes.
+_CSI_PATTERN = re.compile(r"\x1b\[[0-9;?]*[A-Za-z~]")
+#: SS3 cursor keys, which some terminals still send instead of CSI arrows.
+_SS3_PATTERN = re.compile(r"\x1bO[A-Za-z]")
+#: Prefixes that begin an escape sequence we may not have received in full.
+_ESCAPE_PREFIXES = ("\x1b[", "\x1bO")
+
+
+def _tokenize(raw: str) -> tuple[list[str], str]:
+    """Split ``raw`` into complete keys, returning an unfinished tail as well.
+
+    A sequence that is cut off mid-flight is never broken into its own bytes:
+    handing ``\\x1b[<0;15;5`` to the key handler as ``0``, ``1`` and ``5``
+    would type those digits into the app, and *every* digit is a bound filter
+    shortcut. The caller that can read more bytes may complete the tail; the
+    caller that cannot must drop it.
+    """
+    tokens: list[str] = []
+    index = 0
+    total = len(raw)
+    while index < total:
+        char = raw[index]
+        if char != "\x1b":
+            tokens.append(char)
+            index += 1
+            continue
+        match = (
+            _SGR_MOUSE_PATTERN.match(raw, index)
+            or _CSI_PATTERN.match(raw, index)
+            or _SS3_PATTERN.match(raw, index)
+        )
+        if match is not None:
+            tokens.append(match.group(0))
+            index = match.end()
+            continue
+        if raw.startswith(_ESCAPE_PREFIXES, index):
+            return tokens, raw[index:]
+        # A lone ESC: Esc itself, or the prefix of an Alt-<key> chord.
+        tokens.append(char)
+        index += 1
+    return tokens, ""
 
 
 def split_keys(raw: str) -> list[str]:
-    """Split a raw input buffer into individual keys and mouse events."""
+    """Split a raw input buffer into individual keys and mouse events.
+
+    Every byte is accounted for. An escape sequence cut off mid-way comes back
+    as one opaque token, so a partial report can never masquerade as the keys
+    its bytes happen to resemble.
+    """
     if not raw:
         return []
-    return _KEY_SPLIT_PATTERN.findall(raw)
+    tokens, pending = _tokenize(raw)
+    if pending:
+        tokens.append(pending)
+    return tokens
+
+
+def stream_rows_for(height: int) -> int:
+    """Return how many event rows a terminal ``height`` lines tall can show.
+
+    The loop and the dashboard both size the viewport through this helper, so
+    the click hit-test and the painted grid can never disagree about where the
+    stream begins and ends.
+    """
+    return max(0, max(2, _int_or(height, 24) - 3) - STREAM_TOP + 1)
 
 
 class Dashboard:
@@ -298,26 +425,28 @@ class Dashboard:
         self.detail = detail
 
     def render(self, model: Mapping[str, Any]) -> Screen:
-        width = int(model.get("width", 80))
-        height = int(model.get("height", 24))
+        # Every field is treated as untrusted: a frame that cannot be drawn is
+        # worse than a frame with a blank count, so nothing here may raise.
+        width = max(1, _int_or(model.get("width"), 80))
+        height = max(1, _int_or(model.get("height"), 24))
         screen = Screen(width, height)
-        events: Sequence[Mapping[str, Any]] = model.get("events", ())
-        selection = int(model.get("selection", 0))
-        health = model.get("health") or {}
-        status = model.get("status") or {}
-        ledger = status.get("ledger", {}) if isinstance(status, Mapping) else {}
+        events = _events_of(model)
+        selection = _int_or(model.get("selection"), 0)
+        health = _mapping(model.get("health"))
+        status = _mapping(model.get("status"))
+        ledger = _mapping(status.get("ledger"))
 
         self._header(screen, model, health, ledger)
-        body_top = 3
-        body_bottom = height - 3
-        if body_bottom < body_top:
-            body_bottom = body_top - 1
-        stream_rows = max(0, body_bottom - body_top + 1)
+        body_top = STREAM_TOP
+        stream_rows = stream_rows_for(height)
         show_side = bool(model.get("detail", self.detail)) and width >= 72
         stream_width = width - 34 if show_side else width
 
-        scroll_offset = int(model.get("scroll_offset", 0))
-        if scroll_offset <= 0 and selection >= stream_rows and stream_rows > 0:
+        scroll_offset = _int_or(model.get("scroll_offset"), 0)
+        if stream_rows <= 0:
+            # Nothing is visible, so no offset is meaningful.
+            scroll_offset = 0
+        elif scroll_offset <= 0 and selection >= stream_rows:
             scroll_offset = min(selection - stream_rows + 1, max(0, len(events) - stream_rows))
         scroll_offset = max(0, min(scroll_offset, max(0, len(events) - stream_rows)))
 
@@ -368,9 +497,14 @@ class Dashboard:
         ]
         payload = event.get("payload")
         try:
-            payload_json = json.dumps(payload, indent=2, ensure_ascii=False)
-            for pl_line in payload_json.splitlines()[:14]:
+            payload_json = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+            payload_lines = payload_json.splitlines()
+            for pl_line in payload_lines[:_INSPECT_PAYLOAD_LINES]:
                 lines.append(f"  {pl_line}")
+            hidden = len(payload_lines) - _INSPECT_PAYLOAD_LINES
+            if hidden > 0:
+                # Say so rather than letting a long payload look complete.
+                lines.append(f"  … {hidden} more line(s)")
         except Exception:
             lines.append(f"  {payload}")
         lines.append("")
@@ -393,7 +527,7 @@ class Dashboard:
         screen.fill(1, "dim")
         filter_label = str(model.get("filter_label", "all"))
         message = str(model.get("message") or "")
-        left = f" filter: {filter_label}   events: {len(model.get('events', ()))}   dropped: {model.get('dropped', 0)}"
+        left = f" filter: {filter_label}   events: {len(_events_of(model))}   dropped: {model.get('dropped', 0)}"
         screen.put(1, 0, left, "accent" if message else "dim")
         if message:
             screen.put(1, min(screen.width - 1, len(left) + 2), message, "accent")
@@ -423,12 +557,12 @@ class Dashboard:
             actual_index = scroll_offset + offset
             selected = actual_index == selection
             style = "selected" if selected else KIND_STYLE.get(str(event.get("kind")), "default")
-            seq = event.get("seq", "?")
+            seq = _seq_column(event.get("seq"))
             kind = str(event.get("kind", "?"))
             topic = str(event.get("topic", ""))
             producer = str(event.get("producer", ""))
             age = age_of(event.get("ts"))
-            prefix = f"{age} #{seq:<5d} {kind:<7s} {topic:<22s} {producer:<10s} "
+            prefix = f"{age} #{seq} {kind:<7s} {topic:<22s} {producer:<10s} "
             line = prefix + summarize_event(event, max(8, width - len(prefix) - 2))
             screen.put(row, 0, _shorten(line, width), style)
 
@@ -442,11 +576,11 @@ class Dashboard:
         events: Sequence[Mapping[str, Any]] = (),
         selection: int = -1,
     ) -> None:
-        planes = status.get("planes", {}) if isinstance(status, Mapping) else {}
-        signal = planes.get("signal", {}) if isinstance(planes, Mapping) else {}
-        work = planes.get("work", {}) if isinstance(planes, Mapping) else {}
-        kinds = status.get("kinds", {}) if isinstance(status, Mapping) else {}
-        integrity = status.get("integrity", {}) if isinstance(status, Mapping) else {}
+        planes = _mapping(status.get("planes"))
+        signal = _mapping(planes.get("signal"))
+        work = _mapping(planes.get("work"))
+        kinds = _mapping(status.get("kinds"))
+        integrity = _mapping(status.get("integrity"))
 
         for offset in range(rows):
             screen.put(top + offset, col, "│", "border")
@@ -463,16 +597,17 @@ class Dashboard:
         ):
             if cursor >= top + rows:
                 break
-            screen.put(cursor, col + 2, f"{label:<15s}{value:>6d}", style)
+            screen.put(cursor, col + 2, f"{label:<15s}{_int_or(value):>6d}", style)
             cursor += 1
         cursor += 1
         if cursor < top + rows:
             screen.put(cursor, col + 2, " kinds", "bold")
             cursor += 1
-        for kind, count in sorted(kinds.items()):
+        for kind, count in sorted(kinds.items(), key=lambda item: str(item[0])):
             if cursor >= top + rows:
                 break
-            screen.put(cursor, col + 2, f"{kind:<15s}{count:>6d}", KIND_STYLE.get(kind, "default"))
+            label = str(kind)
+            screen.put(cursor, col + 2, f"{label:<15s}{_int_or(count):>6d}", KIND_STYLE.get(label, "default"))
             cursor += 1
         cursor += 1
         if cursor < top + rows:
@@ -530,8 +665,12 @@ class Dashboard:
 
     def _overlay(self, screen: Screen, title: str, lines: Iterable[str]) -> None:
         body = list(lines)
-        box_width = min(screen.width - 2, 62)
-        box_height = min(screen.height - 2, len(body) + 3)
+        # A terminal too small to hold a frame gets no frame, rather than a
+        # torn one painted over rows that do not exist.
+        box_width = max(0, min(screen.width - 2, 62))
+        box_height = max(0, min(screen.height - 2, len(body) + 3))
+        if box_width <= 0 or box_height <= 0:
+            return
         top = max(0, (screen.height - box_height) // 2)
         left = max(0, (screen.width - box_width) // 2)
         for offset in range(box_height):
@@ -659,7 +798,10 @@ class TuiApp:
         return True
 
     def ensure_selection_visible(self) -> None:
-        """Keep the selected row within the visible viewport."""
+        """Keep the selection in range and the selected row in the viewport."""
+        # Clamp first: a shrinking history (or a page key on an empty ledger)
+        # can strand the cursor past the end, where nothing renders as selected.
+        self.selection = max(0, min(self.selection, len(self.events) - 1))
         rows = self.stream_rows
         if rows <= 0 or not self.events:
             self.scroll_offset = 0
@@ -725,7 +867,7 @@ class TuiApp:
             self.selection = max(0, self.selection - max(1, self.stream_rows - 2))
             self.ensure_selection_visible()
         elif key == "\x1b[6~":  # Page Down
-            self.selection = min(len(self.events) - 1, self.selection + max(1, self.stream_rows - 2))
+            self.selection = max(0, min(len(self.events) - 1, self.selection + max(1, self.stream_rows - 2)))
             self.ensure_selection_visible()
         elif key in ("g", "\x1b[F", "\x1b[4~", "\x1bOF"):
             self.selection = max(0, len(self.events) - 1)
@@ -762,50 +904,58 @@ class TuiApp:
             self.request_redraw()
             return
 
-        body = key[3:-1]
-        parts = body.split(";")
-        if len(parts) != 3:
+        match = _SGR_MOUSE_PATTERN.fullmatch(key)
+        if match is None:
+            # Anything that is not a whole SGR report (a truncated packet, a
+            # future extension) is ignored rather than guessed at.
             return
-        try:
-            b = int(parts[0])
-            col = int(parts[1]) - 1
-            row = int(parts[2]) - 1
-        except ValueError:
+        button = int(match.group(1))
+        col = max(0, int(match.group(2)) - 1)
+        row = max(0, int(match.group(3)) - 1)
+        is_release = match.group(4) == "m"
+
+        if button & 32:
+            # Motion/drag reporting is enabled by 1002; only presses act.
             return
+        # Mask the modifier bits (shift 4, alt 8, ctrl 16) so shift+wheel still
+        # scrolls and shift+click still selects.
+        base = button & ~(4 | 8 | 16)
 
-        is_release = key.endswith("m")
-
-        if b == 64:  # Wheel up
-            if self.events:
+        if base & 64:  # Wheel: 64 up, 65 down, 66/67 sideways
+            if not self.events:
+                return
+            direction = base - 64
+            if direction == 0:
                 self.selection = max(0, self.selection - 1)
-                self.ensure_selection_visible()
-                self.request_redraw()
-            return
-        elif b == 65:  # Wheel down
-            if self.events:
+            elif direction == 1:
                 self.selection = min(len(self.events) - 1, self.selection + 1)
+            else:
+                return  # horizontal wheel has nothing to scroll here
+            self.ensure_selection_visible()
+            self.request_redraw()
+            return
+
+        if base != 0 or is_release:  # only a plain left-button press acts
+            return
+
+        body_top = STREAM_TOP
+        if body_top <= row < body_top + self.stream_rows and self.events:
+            offset = row - body_top
+            target = self.scroll_offset + offset
+            if 0 <= target < len(self.events):
+                self.selection = target
                 self.ensure_selection_visible()
                 self.request_redraw()
-            return
-        elif b == 0 and not is_release:  # Left button click
-            body_top = 3
-            if body_top <= row < body_top + self.stream_rows and self.events:
-                offset = row - body_top
-                target = self.scroll_offset + offset
-                if 0 <= target < len(self.events):
-                    self.selection = target
-                    self.ensure_selection_visible()
-                    self.request_redraw()
-            elif row == 1:
-                # Clicked on filter bar
-                self.filter_index = (self.filter_index + 1) % len(FILTER_PRESETS)
-                self.reload_history(client)
-                self.request_redraw()
-            elif row == 0 and col >= max(0, self.last_width - 30):
-                # Clicked near PAUSED
-                self.paused = not self.paused
-                self.message = "paused" if self.paused else ""
-                self.request_redraw()
+        elif row == 1:
+            # Clicked on filter bar
+            self.filter_index = (self.filter_index + 1) % len(FILTER_PRESETS)
+            self.reload_history(client)
+            self.request_redraw()
+        elif row == 0 and col >= max(0, self.last_width - _PAUSED_CLICK_ZONE):
+            # Clicked near PAUSED
+            self.paused = not self.paused
+            self.message = "paused" if self.paused else ""
+            self.request_redraw()
 
     def run_sample(self, client) -> None:
         """Inject one schema-valid demo event so the planes visibly move."""
@@ -886,8 +1036,7 @@ class TuiApp:
         size = get_size(fallback=(100, 30))
         self.last_width = size.columns
         self.last_height = size.lines
-        body_bottom = max(2, size.lines - 3)
-        self.stream_rows = max(0, body_bottom - 3 + 1)
+        self.stream_rows = stream_rows_for(size.lines)
         # The geometry is tracked separately from ``previous``: the cell cache
         # only describes frames we drew, while the terminal may have cleared or
         # reflowed the screen behind our back.
@@ -898,15 +1047,14 @@ class TuiApp:
         stream_ended = False
         with factory(on_resize=self.request_redraw) as reader:
             write = stream.write
-            write(f"\x1b[?1049h{CLEAR_SCREEN}\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h")
             try:
+                write(f"{ALT_SCREEN_ON}{CLEAR_SCREEN}{CURSOR_HIDE}{MOUSE_ON}")
                 while True:
                     size = get_size(fallback=size)
                     geometry = (size.columns, size.lines)
                     self.last_width = size.columns
                     self.last_height = size.lines
-                    body_bottom = max(2, size.lines - 3)
-                    self.stream_rows = max(0, body_bottom - 3 + 1)
+                    self.stream_rows = stream_rows_for(size.lines)
                     # Always consume the request: a resize and SIGWINCH often
                     # arrive together, and a lingering flag would repaint twice.
                     redraw_requested = self.take_redraw_request()
@@ -966,26 +1114,37 @@ class TuiApp:
                     key = reader(0.1)
                     if key is None:
                         continue
-                    # Escape sequences arrive in one burst; read the tail too if incomplete.
-                    if key == "\x1b" or (
-                        key.startswith(("\x1b[", "\x1bO"))
-                        and not key.endswith(("A", "B", "C", "D", "H", "F", "~", "M", "m"))
-                    ):
-                        while True:
-                            tail = reader(0.02)
-                            if not tail:
-                                break
-                            key += tail
-                            if key.endswith(("A", "B", "C", "D", "H", "F", "~", "M", "m")):
-                                break
-                    for token in split_keys(key):
+                    # Escape sequences usually arrive in one burst, but a slow
+                    # pty can hand a mouse report over in pieces. Keep reading
+                    # while the buffer ends in an unfinished sequence; the caps
+                    # bound both the extra latency and the memory a stuck
+                    # sequence can hold.
+                    buffer = key
+                    tokens, pending = _tokenize(buffer)
+                    for _ in range(_MAX_TAIL_READS):
+                        if not pending or len(buffer) >= _MAX_INPUT_BYTES:
+                            break
+                        tail = reader(_TAIL_READ_TIMEOUT)
+                        if not tail:
+                            break
+                        buffer += tail
+                        tokens, pending = _tokenize(buffer)
+                    if pending:
+                        # Still cut off. Hand it over as one opaque token: a bare
+                        # ESC keeps dismissing overlays, and a half-received
+                        # report stays inert instead of typing its coordinates.
+                        tokens.append(pending)
+                    for token in tokens:
                         if not self.handle_key(token, client):
                             return 0
             except KeyboardInterrupt:
                 return 0
             finally:
-                write("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l")
-                stream.flush()
+                # Restoration must never mask the reason the loop ended, and it
+                # runs on every path: detach, Ctrl-C, resize, or a raise.
+                with contextlib.suppress(OSError, ValueError):
+                    write(f"{MOUSE_OFF}{CURSOR_SHOW}{ALT_SCREEN_OFF}")
+                    stream.flush()
 
 
 @contextlib.contextmanager
@@ -1038,6 +1197,11 @@ def terminal_session(*, on_resize=None):
             # keeps the polling reader and simply misses the prompt wakeup.
             previous_handler = None
 
+    # Bytes of a code point split across two reads are held here rather than
+    # decoded into a replacement character, so a pasted or fast-typed non-ASCII
+    # key survives the read boundary intact.
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
     def read_key(timeout: float) -> str | None:
         if stdin is None:
             time.sleep(min(timeout, 0.05))
@@ -1056,14 +1220,22 @@ def terminal_session(*, on_resize=None):
             return None
         try:
             raw = os.read(stdin, 1024)
-            if not raw:
-                return None
-            return raw.decode("utf-8", errors="replace")
         except (OSError, ValueError, io.UnsupportedOperation):
+            # A stdin we cannot read by descriptor (a wrapper, a test harness).
+            # Only touch it when a byte is already waiting: a blocking read here
+            # would freeze the cockpit.
             try:
-                return sys.stdin.read(1)
+                if not select.select([stdin], [], [], 0)[0]:
+                    return None
+                return sys.stdin.read(1) or None
             except Exception:
                 return None
+        if not raw:
+            # EOF. Yield the loop's slice instead of spinning on a closed fd.
+            time.sleep(min(timeout, 0.05))
+            return None
+        text = decoder.decode(raw)
+        return text or None
 
     try:
         yield read_key
